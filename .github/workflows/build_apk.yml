@@ -41,9 +41,10 @@ jobs:
         sudo apt-get install -y -qq zlib1g-dev libncurses5-dev libncursesw5-dev
         sudo apt-get install -y -qq libtinfo5 cmake libffi-dev libssl-dev
 
-    - name: Install buildozer and p4a
+    - name: Install Python dependencies
       run: |
         pip install --upgrade pip
+        pip install cython==0.29.37
         pip install buildozer==1.5.0
         pip install python-for-android==2023.5.21
 
