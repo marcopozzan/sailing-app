@@ -26,27 +26,42 @@ jobs:
         # Also matches P4A_python3_VERSION so host and target stay aligned.
         python-version: '3.11.9'
 
+    - name: Set up JDK 17 (Temurin)
+      # Android Gradle Plugin richiede Java 17. Il runner ubuntu-22.04 ha
+      # Temurin 11 preinstallato come default e Gradle lo trovava al posto
+      # del 17. setup-java imposta JAVA_HOME e lo mette nel PATH.
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Verify Java version
+      run: |
+        echo "JAVA_HOME=$JAVA_HOME"
+        java -version
+        javac -version
+
     - name: Cache buildozer global
       uses: actions/cache@v4
       with:
         path: ~/.buildozer
-        # v2: invalidata per pulire residui della patch precedente rotta.
-        key: buildozer-global-${{ runner.os }}-py3.11.9-v2-${{ hashFiles('buildozer.spec') }}
-        restore-keys: buildozer-global-${{ runner.os }}-py3.11.9-v2-
+        # v3: invalidata di nuovo perche' i dist Gradle in cache erano legati a Java 11.
+        key: buildozer-global-${{ runner.os }}-py3.11.9-jdk17-v3-${{ hashFiles('buildozer.spec') }}
+        restore-keys: buildozer-global-${{ runner.os }}-py3.11.9-jdk17-v3-
 
     - name: Cache buildozer local
       uses: actions/cache@v4
       with:
         path: .buildozer
-        # v2: invalidata per forzare un clone p4a pulito (la versione precedente
-        # aveva pythonforandroid/build.py corrotto da una patch sbagliata).
-        key: buildozer-local-${{ runner.os }}-py3.11.9-v2-${{ hashFiles('buildozer.spec') }}
-        restore-keys: buildozer-local-${{ runner.os }}-py3.11.9-v2-
+        # v3: invalidata per scartare il dist Gradle compilato con Java 11.
+        key: buildozer-local-${{ runner.os }}-py3.11.9-jdk17-v3-${{ hashFiles('buildozer.spec') }}
+        restore-keys: buildozer-local-${{ runner.os }}-py3.11.9-jdk17-v3-
 
     - name: Install system dependencies
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq git zip unzip openjdk-17-jdk
+        # NB: openjdk-17-jdk NON serve piu' qui, setup-java lo provvede.
+        sudo apt-get install -y -qq git zip unzip
         sudo apt-get install -y -qq autoconf libtool pkg-config
         sudo apt-get install -y -qq zlib1g-dev libncurses5-dev libncursesw5-dev
         sudo apt-get install -y -qq libtinfo5 cmake libffi-dev libssl-dev
