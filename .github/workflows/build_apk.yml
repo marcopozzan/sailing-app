@@ -9,6 +9,10 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      # Applicato a ogni invocazione di pip, inclusa la venv creata da p4a.
+      # constraints.txt forza pip<24.2 ovunque, blindando il fix.
+      PIP_CONSTRAINT: ${{ github.workspace }}/constraints.txt
 
     steps:
     - name: Checkout repository
@@ -48,7 +52,7 @@ jobs:
       run: |
         # Pin pip below 24.2 to avoid the resolvelib API churn that broke
         # pip._vendor.resolvelib.structs.RequirementInformation imports.
-        # The p4a venv inherits this pip, so the venv stays sane too.
+        # The p4a venv inherits this pip thanks to PIP_CONSTRAINT.
         python -m pip install --upgrade 'pip<24.2' 'setuptools<70' wheel
         pip install cython==0.29.37
         pip install buildozer==1.5.0
@@ -56,6 +60,9 @@ jobs:
 
     - name: Patch buildozer
       run: python3 patch_buildozer.py
+
+    - name: Patch p4a pip auto-upgrade (installed package)
+      run: python3 patch_p4a_pip.py
 
     - name: Setup p4a and patch recipes
       run: |
@@ -73,6 +80,8 @@ jobs:
             grep "version = " "$FILE" | grep -v "#" | head -1
           fi
         done
+        # Patcha anche il clone locale di p4a (usato di fatto dal build)
+        python3 patch_p4a_pip.py
 
     - name: Build APK
       run: buildozer android debug
