@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 92
+    timeout-minutes: 90
 
     steps:
     - name: Checkout repository
@@ -36,9 +36,10 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq git zip unzip openjdk-17-jdk \
-          autoconf libtool pkg-config zlib1g-dev libncurses5-dev \
-          libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+        sudo apt-get install -y -qq git zip unzip openjdk-17-jdk
+        sudo apt-get install -y -qq autoconf libtool pkg-config
+        sudo apt-get install -y -qq zlib1g-dev libncurses5-dev libncursesw5-dev
+        sudo apt-get install -y -qq libtinfo5 cmake libffi-dev libssl-dev
 
     - name: Install buildozer and p4a
       run: |
@@ -46,83 +47,23 @@ jobs:
         pip install buildozer==1.5.0
         pip install python-for-android==2023.5.21
 
-    - name: Patch buildozer targets/android.py
-      run: |
-        # Trova il file android.py di buildozer
-        ANDROID_PY=$(python3 -c "import buildozer.targets.android as m; print(m.__file__)")
-        echo "Patchando: $ANDROID_PY"
-
-        # Mostra le righe con 'Detected old' per debug
-        grep -n "Detected old\|if any\|rmdir" "$ANDROID_PY" | head -10
-
-        # Patch con Python - sostituisce il blocco if che riclona p4a
-        python3 << 'PYEOF'
-        import re, sys
-        import buildozer.targets.android as m
-        f = m.__file__
-        txt = open(f).read()
-
-        # Sostituisce il blocco if any([cur_url != p4a_url, cur_branch != p4a_branch]):
-        # con if False: pass
-        old_pattern = r'(\s+)if any\(\[cur_url != p4a_url, cur_branch != p4a_branch\]\):.*?buildops\.rmdir\(p4a_dir\)'
-        new_block = r'\1if False:  # PATCH: skip reclone
-\1    pass'
-        new_txt = re.sub(old_pattern, new_block, txt, flags=re.DOTALL)
-
-        if new_txt != txt:
-            open(f, 'w').write(new_txt)
-            print('Patch OK')
-        else:
-            print('Pattern non trovato con regex, provo metodo alternativo...')
-            # Metodo alternativo: trova e sostituisce riga per riga
-            lines = txt.splitlines(keepends=True)
-            new_lines = []
-            skip = False
-            skip_indent = 0
-            for line in lines:
-                stripped = line.lstrip()
-                indent_len = len(line) - len(stripped)
-                if 'Detected old url/branch' in line:
-                    skip = True
-                    skip_indent = indent_len
-                    new_lines.append(' ' * indent_len + 'pass  # PATCH: skip reclone\n')
-                    continue
-                if skip:
-                    if stripped and indent_len <= skip_indent:
-                        skip = False
-                    else:
-                        continue
-                new_lines.append(line)
-            result = ''.join(new_lines)
-            open(f, 'w').write(result)
-            print('Patch alternativa applicata')
-
-        # Verifica sintassi
-        import py_compile
-        try:
-            py_compile.compile(f, doraise=True)
-            print('Sintassi OK')
-        except py_compile.PyCompileError as e:
-            print(f'ERRORE SINTASSI: {e}')
-            sys.exit(1)
-        PYEOF
+    - name: Patch buildozer
+      run: python3 patch_buildozer.py
 
     - name: Setup p4a and patch recipes
       run: |
         P4A_DIR=".buildozer/android/platform/python-for-android"
         mkdir -p "$(dirname $P4A_DIR)"
-
         if [ ! -d "$P4A_DIR/.git" ]; then
-          git clone -b master --single-branch \
-            https://github.com/kivy/python-for-android.git "$P4A_DIR"
+          git clone -b master --single-branch https://github.com/kivy/python-for-android.git "$P4A_DIR"
         fi
-
         for RECIPE in hostpython3 python3; do
           FILE="$P4A_DIR/pythonforandroid/recipes/$RECIPE/__init__.py"
           if [ -f "$FILE" ]; then
-            sed -i 's/version = "[0-9]*\.[0-9]*\.[0-9]*"/version = "3.11.9"/' "$FILE"
-            sed -i "s/version = '[0-9]*\.[0-9]*\.[0-9]*'/version = '3.11.9'/" "$FILE"
-            echo "$RECIPE: $(grep 'version = ' $FILE | grep -v '#' | head -1)"
+            sed -i 's/version = \"[0-9]*\.[0-9]*\.[0-9]*\"/version = \"3.11.9\"/' "$FILE"
+            sed -i "s/version = \'[0-9]*\.[0-9]*\.[0-9]*\'/version = \'3.11.9\'/" "$FILE"
+            echo "$RECIPE version after patch:"
+            grep "version = " "$FILE" | grep -v "#" | head -1
           fi
         done
 
