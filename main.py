@@ -1,40 +1,13 @@
 """
-Sailing Racing System — Android TABLET v1.18
+Sailing Racing System — Android TABLET v1.5
 Grafica originale mantenuta (bussola, canvas tattico, grafico velocita).
 Layout adattivo: _cols_h() usa Window.height - no altezze fisse sui container.
 Fix SIGABRT: Clock.schedule_once su tutti canvas draw + guard width/height.
 
-v1.5: download/upload polari, waypoints e tracks via Azure Blob Storage diretto.
-v1.6: polar.json v2 con sezione 'sails' (definitions + crossover).
-v1.7: Fix crash "Scarica dal cloud": niente piu' riuso di widget Kivy.
-v1.8: Refactor totale dei popup cloud con pattern bulletproof.
-v1.9: UI Settings: rimossa COMPLETAMENTE la sezione Azure Blob.
-v1.10: Sostituiti i 3 SAS token con un'unica blob_account_key (Shared Key).
-v1.11: Fix bug crash su Scarica da web (waypoints/polare).
-v1.12: Rimossi pulsanti "Carica al cloud" da WaypointsScreen e PolarScreen.
-v1.13: Fix bug "Polare DISATTIVATA" anche con polare attiva.
-v1.14: Fix errore SSL CERTIFICATE_VERIFY_FAILED su Android.
-v1.15: StartLineScreen: pulsante "Invia al cloud" sotto al toggle log.
-v1.16: Sostituita LoggingScreen con WeatherScreen (previsioni meteo dal blob).
-v1.17: Rimossa COMPLETAMENTE tutta la funzionalita' di logging tracks.
-v1.18: REINTRODOTTA la schermata LOG con pattern semplice e dedicato:
-       - TrackLogger semplificato (CSV una riga ogni 5s) con nome file
-         track_YYYY-MM-DD_HH-MM-SS.csv basato su istante di START.
-       - LoggingScreen nuova: colonna SX con Start/Stop e pulsante
-         "Invia al cloud" (one-shot upload del CSV chiuso al blob storage
-         tracks/{boat}/<file>.csv, Shared Key auth).
-         Colonna DX con CLOUD UPLOAD LIVE: toggle ON/OFF + selettore
-         intervallo (30s, 1m, 2m, 5m, 10m). Quando ON, snapshot HTTPS
-         a backend ogni N secondi -> SQL Server tabella 'traks' di
-         sailing-sql-7645.database.windows.net.
-       - cloud_interval_min sostituito da cloud_interval_s (granulare al
-         secondo, min 30s). Migrazione automatica config esistenti.
-       - Sezione CLOUD UPLOAD rimossa dalla SettingsScreen (spostata in
-         LoggingScreen). Settings: solo NMEA, twd window, utility diag.
-       - NOTA SQL Server: il tablet NON puo' parlare direttamente con
-         Azure SQL via TDS (no driver pyodbc su Android Kivy). Usa il
-         backend Azure Functions (cloud_url) come proxy: il tablet manda
-         JSON via HTTPS, il backend fa l'INSERT su SQL.
+v1.5: download/upload polari, waypoints e tracks via Azure Blob Storage diretto
+      (https://sailingapp.blob.core.windows.net). Sostituisce il flusso API.
+      Container: polars, waypoints, tracks (sottocartella per boat_id, default 'soar').
+      Doppia scrittura: file locali (sandbox app) + cloud (blob).
 """
 
 import math, json, os, csv, socket, threading, time
@@ -47,46 +20,19 @@ from datetime import datetime, timezone
 # =============================================================================
 # Su Android il sistema non espone le CA root in formato leggibile da Python:
 # servono o (a) il pacchetto certifi nei requirements del buildozer.spec,
-# o (b) un fallback che cerca i CA nei path standard del sistema Android.
+# o (b) un fallback senza verifica per servizi di test come webhook.site.
 #
-# Logica usata (in ordine di preferenza):
-# 1) certifi: ideale (CA Mozilla aggiornati, ~250KB)
-# 2) Path Android conosciuti: /system/etc/security/cacerts/ (cartella di pem)
-#    o /etc/ssl/certs/ca-certificates.crt (bundle Linux/Termux)
-# 3) ssl.create_default_context() di base (su Android puro NON funziona, su
-#    desktop si')
-# 4) Per le richieste verso Azure Blob Storage abilitiamo un fallback
-#    automatico: se la verifica TLS fallisce, ritentiamo con context
-#    unverified. La sicurezza non e' compromessa perche' tutte le richieste
-#    al blob sono firmate con HMAC-SHA256 (Shared Key) sui contenuti:
-#    l'integrita' del payload e' garantita anche senza TLS verification.
-#    Vedi _make_blob_ssl_context() e i siti d'uso piu' sotto.
+# Logica usata:
+# 1) Provo a creare un context con certifi: ideale per backend reali in HTTPS
+# 2) Se certifi manca o il file CA e' assente, uso comunque context default
+# 3) Se il POST fallisce con errore SSL E l'URL e' whitelisted (webhook.site /
+#    requestbin / beeceptor), riprovo UNA VOLTA con context unverified.
+#    Questo evita di richiedere il rebuild APK solo per test.
+# 4) La diagnostica _SSL_DIAG e' visibile nello status box di Settings.
 
 _SSL_DIAG = '?'
 _SSL_CTX_VERIFIED = None    # con verifica (usato di default)
-_SSL_CTX_UNVERIFIED = None  # senza verifica (fallback per Azure / test)
-
-def _find_android_ca_bundle():
-    """Cerca un CA bundle nei path standard del sistema Android/Linux.
-    Restituisce path al file .crt se trovato e leggibile (>1KB), altrimenti None.
-
-    Path comuni:
-    - /system/etc/security/cacerts/  (Android: directory di pem singoli, NON
-      compatibile con cafile= che vuole UN solo file. Skip in questa funzione.)
-    - /etc/ssl/certs/ca-certificates.crt  (Linux/Termux/Debian: bundle unico)
-    - /system/etc/security/cacerts.bks    (Android: BouncyCastle, non usabile)
-    """
-    candidates = [
-        '/etc/ssl/certs/ca-certificates.crt',  # Termux/Debian-like
-        '/etc/pki/tls/certs/ca-bundle.crt',     # RHEL-like
-    ]
-    for p in candidates:
-        try:
-            if os.path.exists(p) and os.path.getsize(p) > 1024:
-                return p
-        except OSError:
-            continue
-    return None
+_SSL_CTX_UNVERIFIED = None  # senza verifica (fallback per test endpoints)
 
 try:
     import certifi
@@ -98,25 +44,13 @@ try:
         _SSL_CTX_VERIFIED = ssl.create_default_context()
         _SSL_DIAG = f'certifi vuoto:{_ca_path}'
 except ImportError:
-    # certifi NON installato: prova path Android prima di arrenderti
-    _ca_android = _find_android_ca_bundle()
-    if _ca_android:
-        try:
-            _SSL_CTX_VERIFIED = ssl.create_default_context(cafile=_ca_android)
-            _SSL_DIAG = f'CA Android: {_ca_android}'
-        except Exception:
-            _SSL_CTX_VERIFIED = ssl.create_default_context()
-            _SSL_DIAG = f'CA Android falliti: default'
-    else:
-        _SSL_CTX_VERIFIED = ssl.create_default_context()
-        _SSL_DIAG = 'NO certifi (default - su Android probabilmente fallira\')'
+    _SSL_CTX_VERIFIED = ssl.create_default_context()
+    _SSL_DIAG = 'NO certifi (default)'
 except Exception as _e:
     _SSL_CTX_VERIFIED = ssl.create_default_context()
     _SSL_DIAG = f'certifi err:{_e}'
 
-# Context SENZA verifica: usato come fallback per test endpoint e per
-# Azure Blob Storage quando i CA non sono disponibili (la firma Shared Key
-# garantisce l'integrita' del payload anche senza TLS verification).
+# Context senza verifica: usato come fallback per test endpoint (webhook.site).
 try:
     _SSL_CTX_UNVERIFIED = ssl._create_unverified_context()
 except Exception:
@@ -126,57 +60,6 @@ except Exception:
 # Per backend reali NON aggiungerli qui: il certificato deve verificare.
 _SSL_TEST_HOSTS = ('webhook.site', 'requestbin.com', 'beeceptor.com',
                     'pipedream.com', 'mockbin.com')
-
-def _is_blob_url(url):
-    """True se l'URL punta ad Azure Blob Storage (qualsiasi account).
-    Usato per decidere se attivare il fallback automatico SSL unverified
-    in caso di errore di verifica certificato. Sicuro perche' le richieste
-    al blob sono firmate con HMAC-SHA256 sui contenuti."""
-    return '.blob.core.windows.net' in (url or '').lower()
-
-def _is_ssl_cert_error(exc):
-    """True se l'eccezione e' un errore di verifica certificato SSL.
-    Cattura ssl.SSLCertVerificationError (Python 3.7+) e i casi dove
-    URLError wrappa un SSLError sottostante (la maggior parte su Android)."""
-    if isinstance(exc, ssl.SSLError):
-        msg = str(exc).lower()
-        return ('certificate' in msg or 'cert_verify' in msg
-                or 'self signed' in msg or 'unable to get local issuer' in msg)
-    if isinstance(exc, urllib.error.URLError):
-        reason = getattr(exc, 'reason', None)
-        if isinstance(reason, ssl.SSLError):
-            msg = str(reason).lower()
-            return ('certificate' in msg or 'cert_verify' in msg
-                    or 'unable to get local issuer' in msg)
-    return False
-
-def urlopen_with_ssl_fallback(req, timeout=30):
-    """urllib.request.urlopen con fallback automatico SSL unverified per
-    Azure Blob Storage. Comportamento:
-
-    1. Tenta con _SSL_CTX_VERIFIED (CA bundle se trovato).
-    2. Se fallisce con errore di verifica certificato E l'URL e' del blob
-       storage Azure, ritenta con _SSL_CTX_UNVERIFIED.
-    3. Per altri errori SSL (su domini non-Azure), ri-solleva l'eccezione
-       (la verifica TLS resta importante per altri servizi).
-
-    Questo e' sicuro per Azure Blob perche' tutte le richieste sono firmate
-    con HMAC-SHA256 (Shared Key) sui contenuti: l'integrita' del payload e'
-    garantita anche senza TLS verification. Su Android puro dove i CA
-    Mozilla non sono disponibili, questo evita il blocco totale.
-
-    Restituisce il context manager di urlopen (usalo in 'with' come al solito)."""
-    try:
-        return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX_VERIFIED)
-    except (ssl.SSLError, urllib.error.URLError) as e:
-        if _is_ssl_cert_error(e) and _is_blob_url(req.full_url):
-            if _SSL_CTX_UNVERIFIED is not None:
-                print(f'urlopen_with_ssl_fallback: SSL verify fallita per '
-                      f'{req.full_url[:60]}, retry unverified (Shared Key '
-                      f'garantisce integrita\')')
-                return urllib.request.urlopen(req, timeout=timeout,
-                                                context=_SSL_CTX_UNVERIFIED)
-        raise
 
 os.environ.setdefault('KIVY_NO_ENV_CONFIG', '1')
 
@@ -259,44 +142,40 @@ LOG_DIR        = 'logs'
 SIDEBAR_W   = dp(155)
 TITLE_H     = dp(60)
 BOX_H       = dp(200)  # Mantenuto solo per riferimento (non piu' usato come altezza fissa)
-# URL di default per il cloud upload. webhook.site e' un servizio di test che
-# riceve POST e li mostra in tempo reale. Sostituibile da Settings.
-CLOUD_URL_DEFAULT = 'https://webhook.site/7935ad3e-065c-4780-8c76-5eeccd95a74c'
+# URL di default per il cloud upload live (snapshot JSON periodici).
+# Punta a un endpoint REST (Azure Functions / Web App) che riceve POST e
+# persiste i dati. Sostituibile da Settings.
+CLOUD_URL_DEFAULT = 'https://sailing-api-7960.azurewebsites.net/api/track'
 
 # =============================================================================
-# AZURE BLOB STORAGE -- accesso diretto con Shared Key auth (v1.10+)
+# AZURE BLOB STORAGE -- accesso diretto (no API intermedia)
 # =============================================================================
 # Architettura cloud:
 # - Storage account: sailingapp.blob.core.windows.net
-# - Container 'polars'      polare per barca
+# - Container 'polars'      (lettura pubblica): polari per barca
 #       https://sailingapp.blob.core.windows.net/polars/{boat}/polar.json
-# - Container 'waypoints'   waypoint per barca
+# - Container 'waypoints'   (lettura pubblica): waypoint per barca
 #       https://sailingapp.blob.core.windows.net/waypoints/{boat}/waypoints.json
-# - Container 'meteo'       previsioni meteo precaricate dal backend per barca
-#       https://sailingapp.blob.core.windows.net/meteo/{boat}/forecast.json
+# - Container 'tracks'      (write con SAS):    log CSV per barca
+#       https://sailingapp.blob.core.windows.net/tracks/{boat}/{filename}.csv
 #
 # Identificativo barca: 'cloud_boat_id' nel sailing_config.json (default 'soar').
 #
-# Nota: il container 'tracks' (log CSV) non e' piu' usato dal tablet a partire
-# dalla v1.17. Tutto il flusso di logging e upload tracks e' stato rimosso.
-#
-# Identificativo barca: 'cloud_boat_id' nel sailing_config.json (default 'soar').
-#
-# Autenticazione: Shared Key (HMAC-SHA256) con la chiave master dell'account
-#   (campo 'blob_account_key' di sailing_config.json). Tutte le richieste
-#   (GET/PUT/LIST) sono firmate dall'helper azure_sign_request().
-#   Nessun SAS token richiesto: la chiave permette qualsiasi operazione.
-#   ATTENZIONE: chi ha la chiave master ha controllo totale dello storage
-#   account. Non condividere il sailing_config.json con altri tablet/utenti.
+# Lettura (download): GET diretto al blob -- richiede solo che il container abbia
+#   "Anonymous read access for blobs". Nessun token client-side.
+# Scrittura (upload tracks): PUT con SAS token a livello container, configurato
+#   in 'tracks_sas_token' nel sailing_config.json. Esempio di SAS token:
+#       sv=2022-11-02&sr=c&sp=cw&se=2027-...&sig=...
+#   La URL finale per il PUT diventa:
+#       {blob_url}?{sas_token}
 BLOB_BASE_DEFAULT       = 'https://sailingapp.blob.core.windows.net'
 BLOB_CONTAINER_POLARS   = 'polars'
 BLOB_CONTAINER_WAYPOINTS = 'waypoints'
-BLOB_CONTAINER_METEO    = 'meteo'
-BLOB_CONTAINER_TRACKS   = 'tracks'  # log CSV regata, uploadato come file unico
+BLOB_CONTAINER_TRACKS   = 'tracks'
+BLOB_CONTAINER_TRACKSLIVE = 'trackslive'
+BLOB_CONTAINER_CONFIG   = 'config'
+BLOB_CONTAINER_LOGS     = 'logs'
 BOAT_ID_DEFAULT         = 'soar'
-# File previsioni meteo precaricate dal backend nel blob 'meteo/{boat}/'.
-# Formato JSON definito in WeatherScreen.parse_forecast() (vedi docstring).
-METEO_FILE              = 'forecast.json'
 
 # Base URL del servizio cloud (legacy: backward-compat per config esistenti).
 # Il campo 'api_base' nel sailing_config.json e' ora ignorato dal flusso
@@ -317,131 +196,6 @@ MARK_PASS_TICKS_INCREASING = 3
 # Evita che dopo uno switch lo stesso meccanismo scatti subito di nuovo
 # se la distanza dalla boa nuova oscilla.
 MARK_PASS_COOLDOWN_S = 5.0
-
-# =============================================================================
-# AZURE STORAGE SHARED KEY (HMAC-SHA256) -- firma richieste HTTP al blob
-# =============================================================================
-# Implementazione minimale dell'algoritmo "Shared Key" descritto in:
-#   https://learn.microsoft.com/rest/api/storageservices/authorize-with-shared-key
-#
-# L'app firma le richieste HTTP al blob storage con la chiave master
-# dell'account (blob_account_key in sailing_config.json). Non richiede
-# librerie esterne (azure-storage-blob): usa solo stdlib (hmac, hashlib,
-# base64, urllib.parse). Questo evita dipendenze nel build Android.
-#
-# Usage:
-#   from urllib.request import Request
-#   url = 'https://sailingapp.blob.core.windows.net/tracks?restype=container&comp=list&prefix=soar/'
-#   req = Request(url, method='GET')
-#   azure_sign_request(req, account_name='sailingapp', account_key='base64key==')
-#   urlopen(req)
-#
-# Funziona per GET, PUT, DELETE, HEAD su blob. PUT richiede aggiungere
-# l'header 'x-ms-blob-type: BlockBlob' al Request PRIMA della firma.
-
-import hmac as _hmac
-import hashlib as _hashlib
-import base64 as _b64
-from email.utils import formatdate as _formatdate
-from urllib.parse import urlsplit as _urlsplit, parse_qs as _parse_qs
-
-def _azure_canonical_resource(account_name, parsed_url):
-    """Costruisce CanonicalizedResource per Shared Key.
-    Formato: /{account_name}{path}\n{header}:{val1,val2,...}\n... (query
-    parameters ordinati alfabeticamente, valori comma-joined ordinati).
-    """
-    res = f'/{account_name}{parsed_url.path}'
-    if parsed_url.query:
-        # parse_qs ritorna dict[str, list[str]]; chiavi case-insensitive (lower).
-        params = _parse_qs(parsed_url.query, keep_blank_values=True)
-        # Ordino alfabeticamente sulle chiavi (lowercase)
-        items = sorted(params.items(), key=lambda kv: kv[0].lower())
-        for key, vals in items:
-            joined = ','.join(sorted(vals))
-            res += f'\n{key.lower()}:{joined}'
-    return res
-
-def _azure_canonical_headers(headers_dict):
-    """Costruisce CanonicalizedHeaders per Shared Key.
-    Tutti gli header che iniziano con 'x-ms-', case-insensitive, ordinati
-    alfabeticamente, formato '{name}:{value}\n' (valore trimmed)."""
-    ms = []
-    for k, v in headers_dict.items():
-        kl = k.lower()
-        if kl.startswith('x-ms-'):
-            ms.append((kl, str(v).strip()))
-    ms.sort(key=lambda kv: kv[0])
-    return ''.join(f'{k}:{v}\n' for k, v in ms)
-
-def azure_sign_request(req, account_name, account_key):
-    """Firma una urllib.request.Request con Azure Shared Key.
-    Aggiunge gli header 'x-ms-date', 'x-ms-version', 'Authorization'.
-
-    req: urllib.request.Request gia' costruito (con method, headers, data se PUT).
-    account_name: nome dello storage account (es. 'sailingapp').
-    account_key: chiave master in base64 (dal portal Azure > Access Keys).
-
-    Per PUT di blob, l'utente deve gia' aver settato:
-      - Content-Type
-      - x-ms-blob-type (di solito 'BlockBlob')
-    PRIMA di chiamare questa funzione, perche' fanno parte della firma.
-    """
-    # Timestamp HTTP RFC 1123 obbligatorio (formato: 'Mon, 27 Jan 2025 ...')
-    date_str = _formatdate(timeval=None, localtime=False, usegmt=True)
-    # Header obbligatori per Shared Key
-    req.add_header('x-ms-date', date_str)
-    req.add_header('x-ms-version', '2020-04-08')
-
-    # === Calcolo StringToSign ===
-    # Ordine FISSO definito da Microsoft per l'algoritmo Shared Key (no Lite).
-    # Tutti i valori sono dell'header se presente, altrimenti stringa vuota.
-    method = req.get_method().upper()
-    h = {k.lower(): v for k, v in req.header_items()}
-
-    content_length = h.get('content-length', '')
-    if content_length == '0':  # Microsoft: 0 va trattato come empty string
-        content_length = ''
-
-    fields = [
-        method,
-        h.get('content-encoding', ''),
-        h.get('content-language', ''),
-        content_length,
-        h.get('content-md5', ''),
-        h.get('content-type', ''),
-        '',  # Date: empty perche' usiamo x-ms-date (header alternativo)
-        h.get('if-modified-since', ''),
-        h.get('if-match', ''),
-        h.get('if-none-match', ''),
-        h.get('if-unmodified-since', ''),
-        h.get('range', ''),
-    ]
-    string_to_sign = '\n'.join(fields) + '\n'
-    string_to_sign += _azure_canonical_headers(h)
-    string_to_sign += _azure_canonical_resource(account_name,
-                                                 _urlsplit(req.full_url))
-
-    # === HMAC-SHA256 ===
-    try:
-        key_bytes = _b64.b64decode(account_key)
-    except Exception as e:
-        raise ValueError(f'blob_account_key non e\' base64 valido: {e}')
-    sig = _b64.b64encode(
-        _hmac.new(key_bytes, string_to_sign.encode('utf-8'),
-                  _hashlib.sha256).digest()
-    ).decode('ascii')
-    req.add_header('Authorization', f'SharedKey {account_name}:{sig}')
-    return req
-
-def _account_name_from_blob_base(blob_base):
-    """Estrae il nome account da un URL tipo
-    'https://sailingapp.blob.core.windows.net' -> 'sailingapp'."""
-    try:
-        host = _urlsplit(blob_base).hostname or ''
-        # host = 'sailingapp.blob.core.windows.net'
-        return host.split('.')[0] if host else ''
-    except Exception:
-        return ''
 
 def get_data_dir():
     """Restituisce la directory dove salvare config, polari e log.
@@ -499,6 +253,295 @@ CONFIG_PATH     = os.path.join(DATA_DIR, CONFIG_FILE)
 POLAR_PATH      = os.path.join(DATA_DIR, POLAR_FILE)
 WAYPOINTS_PATH  = os.path.join(DATA_DIR, WAYPOINTS_FILE)
 LOG_PATH        = os.path.join(DATA_DIR, LOG_DIR)
+# Sottocartella dedicata ai log errori (separata da quella dei track CSV
+# cosi' l'upload tracks non si "porta dietro" log di sistema e viceversa).
+ERROR_LOG_DIR   = os.path.join(LOG_PATH, 'errors')
+
+
+# =============================================================================
+# ERROR LOGGER -- raccolta centralizzata di errori e crash
+# =============================================================================
+#
+# Tre canali di cattura:
+#   1) log_error(msg)        chiamato esplicitamente nel codice
+#   2) sys.excepthook        eccezioni non gestite nel main thread
+#   3) threading.excepthook  eccezioni non gestite nei thread (Py 3.8+)
+#   4) sys.stderr            tutto cio' che finisce su stderr (stack trace
+#                            di librerie, print() di altri moduli) viene
+#                            duplicato anche nel file
+#
+# File di log: un file al giorno
+#   {LOG_PATH}/errors/errors_YYYY-MM-DD.log
+# Cosi' non si accumulano migliaia di file ma neanche un unico file gigante.
+#
+# Upload al blob: il bottone in LoggingScreen chiama upload_today_to_blob()
+# che PUTta il file del giorno corrente nel container 'logs/{boat_id}/'.
+# Si possono uploadare anche i log di giorni precedenti via upload_all_to_blob().
+import traceback
+import sys
+
+class ErrorLogger:
+    """Logger di errori thread-safe con file giornaliero locale + upload blob.
+
+    Threadsafe: tutte le scritture sono protette da lock. Le append al file
+    sono singole chiamate write() che il filesystem garantisce atomiche per
+    payload < PIPE_BUF (~4KB), sufficienti per i messaggi tipici. Il lock
+    e' di backup per la formazione del messaggio + flush.
+
+    Non solleva mai eccezioni: se il logger stesso fallisce (disco pieno,
+    permessi negati), stampa l'errore originale su stderr e prosegue, per
+    non amplificare il problema bloccando l'app.
+    """
+
+    def __init__(self, dir_path):
+        self.dir_path = dir_path
+        self._lock = threading.Lock()
+        # Conta gli errori catturati dall'avvio (per UI)
+        self.count = 0
+        # Ultimo timestamp di errore registrato (per UI)
+        self.last_error_ts = None
+        self.last_error_msg = None
+        try:
+            os.makedirs(self.dir_path, exist_ok=True)
+        except Exception as e:
+            # Non blocchiamo l'app: l'app deve partire anche se il logger no
+            print(f'ErrorLogger init: cannot create {dir_path}: {e}',
+                  file=sys.__stderr__)
+
+    def _current_file(self):
+        """Path del file di log per oggi (YYYY-MM-DD)."""
+        day = datetime.now().strftime('%Y-%m-%d')
+        return os.path.join(self.dir_path, f'errors_{day}.log')
+
+    def log_error(self, msg, exc=None):
+        """Registra un errore. Se exc e' un'eccezione, include lo stacktrace.
+
+        Formato di una riga (su piu' righe se stacktrace):
+            [2026-05-13T14:23:05Z] [thread-name] msg
+              (eventuale stacktrace indentato)
+        """
+        try:
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            tname = threading.current_thread().name
+            head = f'[{ts}] [{tname}] {msg}'
+            tail = ''
+            if exc is not None:
+                # exc puo' essere un'eccezione o una tuple sys.exc_info()
+                if isinstance(exc, tuple) and len(exc) == 3:
+                    tb_lines = traceback.format_exception(*exc)
+                else:
+                    tb_lines = traceback.format_exception(
+                        type(exc), exc, exc.__traceback__)
+                tail = '\n' + ''.join('  ' + l for l in tb_lines)
+            full = head + tail + '\n'
+            with self._lock:
+                self.count += 1
+                self.last_error_ts = time.time()
+                # Tronca il messaggio per la UI (no stacktrace, solo head)
+                self.last_error_msg = msg[:200]
+                try:
+                    with open(self._current_file(), 'a', encoding='utf-8') as f:
+                        f.write(full)
+                except Exception as e:
+                    # Disco pieno / permessi / ecc.: stampa su stderr originale
+                    # (non self.stderr che reindirizzerebbe ricorsivamente)
+                    print(f'ErrorLogger write fail: {e}',
+                          file=sys.__stderr__)
+        except Exception as e:
+            # Difesa estrema: il logger non deve mai propagare eccezioni
+            try:
+                print(f'ErrorLogger log_error meta-error: {e}',
+                      file=sys.__stderr__)
+            except Exception:
+                pass
+
+    def install_global_hooks(self):
+        """Installa hook per catturare:
+        - eccezioni non gestite nel main thread (sys.excepthook)
+        - eccezioni non gestite nei thread (threading.excepthook, Py 3.8+)
+        - tutto cio' che viene scritto su sys.stderr (stack trace di terzi,
+          print con file=sys.stderr, warnings, ecc.)
+
+        Le scritture su stderr restano visibili anche su logcat: il duplicatore
+        scrive sia sul file sia sullo stderr originale.
+        """
+        # 1) Eccezioni non gestite main thread
+        orig_excepthook = sys.excepthook
+        def _hook(exc_type, exc_value, tb):
+            try:
+                self.log_error(
+                    f'Unhandled exception: {exc_type.__name__}: {exc_value}',
+                    exc=(exc_type, exc_value, tb))
+            finally:
+                # Chiama anche l'hook originale (cosi' Kivy/SDL vedono il crash)
+                try: orig_excepthook(exc_type, exc_value, tb)
+                except Exception: pass
+        sys.excepthook = _hook
+
+        # 2) Eccezioni nei thread (Python 3.8+)
+        if hasattr(threading, 'excepthook'):
+            orig_t_hook = threading.excepthook
+            def _t_hook(args):
+                try:
+                    self.log_error(
+                        f'Thread "{args.thread.name}" exception: '
+                        f'{args.exc_type.__name__}: {args.exc_value}',
+                        exc=(args.exc_type, args.exc_value, args.exc_traceback))
+                finally:
+                    try: orig_t_hook(args)
+                    except Exception: pass
+            threading.excepthook = _t_hook
+
+        # 3) Redirect stderr (duplica nel file)
+        sys.stderr = _StderrTee(sys.__stderr__, self)
+
+    def list_log_files(self):
+        """Restituisce lista di tuple (filename, path, size_bytes), ordinata
+        dalla piu' recente. Solo file .log nella dir."""
+        out = []
+        try:
+            if os.path.isdir(self.dir_path):
+                for fn in sorted(os.listdir(self.dir_path), reverse=True):
+                    if not fn.endswith('.log'):
+                        continue
+                    p = os.path.join(self.dir_path, fn)
+                    try:
+                        sz = os.path.getsize(p)
+                    except Exception:
+                        sz = 0
+                    out.append((fn, p, sz))
+        except Exception as e:
+            print(f'ErrorLogger list_log_files: {e}', file=sys.__stderr__)
+        return out
+
+    def upload_to_blob(self, dm, only_today=True, timeout=30):
+        """Upload dei file di log al blob storage container 'logs/{boat_id}/'.
+
+        Riusa lo STESSO SAS token usato per 'tracks' (tracks_sas_token). Per un
+        Account SAS funziona out-of-the-box; per Container SAS servirebbe un
+        SAS dedicato (non implementato qui per semplicita').
+
+        Args:
+          dm: DataManager (per blob_base, cloud_boat_id, tracks_sas_token)
+          only_today: se True carica solo il file del giorno corrente,
+                      se False carica TUTTI i file di log presenti
+          timeout: timeout per ogni PUT in secondi
+
+        Restituisce (ok_bool, msg_str). msg_str riassume cosa e' stato caricato
+        o l'errore. In caso di mix successo/errore, restituisce False con dettaglio."""
+        if not dm.cloud_boat_id:
+            return False, 'cloud_boat_id non configurato'
+        sas = (dm.tracks_sas_token or '').lstrip('?').strip()
+        if not sas:
+            return False, 'tracks_sas_token non configurato'
+        base = (dm.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
+
+        files = self.list_log_files()
+        if only_today:
+            today_file = os.path.basename(self._current_file())
+            files = [t for t in files if t[0] == today_file]
+        if not files:
+            return False, ('Nessun log da caricare'
+                           if only_today else 'Cartella log vuota')
+
+        from urllib.parse import quote
+        uploaded = []
+        errors = []
+        for fn, path, sz in files:
+            safe = quote(fn, safe='._-')
+            url = (f'{base}/{BLOB_CONTAINER_LOGS}/{dm.cloud_boat_id}/'
+                   f'{safe}?{sas}')
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+                req = urllib.request.Request(
+                    url, data=data, method='PUT',
+                    headers={
+                        'Content-Type':   'text/plain; charset=utf-8',
+                        'x-ms-blob-type': 'BlockBlob',
+                    })
+                ctx = _SSL_CTX_VERIFIED or ssl.create_default_context()
+                with urllib.request.urlopen(req, timeout=timeout,
+                                             context=ctx) as resp:
+                    if resp.status < 300:
+                        uploaded.append((fn, sz))
+                    else:
+                        errors.append(f'{fn}: HTTP {resp.status}')
+            except urllib.error.HTTPError as e:
+                try:
+                    body = e.read().decode('utf-8', errors='replace')[:120]
+                except Exception:
+                    body = ''
+                errors.append(f'{fn}: HTTP {e.code} {body}')
+            except Exception as e:
+                errors.append(f'{fn}: {type(e).__name__}: {e}')
+
+        if errors and not uploaded:
+            return False, '; '.join(errors[:3])
+        if errors:
+            return False, (f'{len(uploaded)} OK, {len(errors)} errori: '
+                           + '; '.join(errors[:3]))
+        sizes = sum(sz for _, sz in uploaded)
+        return True, (f'{len(uploaded)} file caricato/i '
+                      f'({sizes//1024} KB)')
+
+
+class _StderrTee:
+    """File-like che duplica le scritture sia su uno stream (lo stderr
+    originale, visibile in logcat) sia nel file di log via ErrorLogger.
+
+    Non logghiamo OGNI riga come errore: solo le righe che contengono
+    'Error', 'Exception', 'Traceback' o 'ERROR'. Le altre vanno solo
+    su stderr (rumore di librerie, warning normali). Cosi' il file
+    errors_YYYY-MM-DD.log resta leggibile.
+    """
+    _ERROR_PATTERNS = ('Error', 'Exception', 'Traceback', 'ERROR', 'CRITICAL')
+
+    def __init__(self, original_stream, logger):
+        self.stream = original_stream
+        self.logger = logger
+        self._buffer = ''
+
+    def write(self, data):
+        try:
+            self.stream.write(data)
+        except Exception:
+            pass
+        # Riga-per-riga: bufferizza fino al \n
+        try:
+            self._buffer += data
+            while '\n' in self._buffer:
+                line, self._buffer = self._buffer.split('\n', 1)
+                if any(p in line for p in self._ERROR_PATTERNS):
+                    self.logger.log_error(f'[stderr] {line}')
+        except Exception:
+            # Non propaghiamo nulla: stderr deve essere sempre scrivibile
+            pass
+
+    def flush(self):
+        try: self.stream.flush()
+        except Exception: pass
+
+    def isatty(self):
+        try: return self.stream.isatty()
+        except Exception: return False
+
+
+# Istanza singleton del logger di errori. Viene istanziata QUI subito perche'
+# molti `print(...)` e quasi tutti i blocchi try/except del modulo possono
+# essere chiamati gia' a import-time. install_global_hooks() viene chiamata
+# da SailingTabletApp.build() per agganciare sys.excepthook & co.
+_error_logger = ErrorLogger(ERROR_LOG_DIR)
+
+
+def log_err(msg, exc=None):
+    """Wrapper conciso per registrare un errore. Usabile da qualsiasi parte
+    del codice come:
+        log_err(f'_load_cfg: {e}')
+        log_err('failed parse', exc=e)
+    """
+    _error_logger.log_error(msg, exc=exc)
+
 
 def parse_coord(s, is_lat=True):
     """Converte una stringa di coordinata in gradi decimali (float).
@@ -682,6 +725,59 @@ def _format_waypoints_file(wpts):
     return '\n'.join(parts) + '\n'
 
 
+def fetch_remote_config(blob_base, boat_id, timeout=8):
+    """Scarica sailing_config.json dal blob storage cloud per la barca data.
+
+    URL pattern:
+        {blob_base}/config/{boat_id}/sailing_config.json
+
+    Il container 'config' deve essere in lettura pubblica (come 'polars' e
+    'waypoints'): nessun SAS token usato lato client. Cosi' un'azienda puo'
+    pubblicare il config "factory" della barca sul cloud e ogni nuovo tablet
+    al primo avvio lo scarica automaticamente, senza dover spedire il
+    sailing_config.json a mano.
+
+    Restituisce:
+        (True, dict_config, None) se download e parse OK
+        (False, None, 'msg_errore')
+
+    Casi di fallimento gestiti (tutti finiscono in fallback ai default):
+    - 404 (blob non esistente per questa barca, caso normale)
+    - 403 (container non pubblico — config richiede SAS, non gestito qui)
+    - Timeout/DNS/rete (offline al primo avvio)
+    - JSON malformato sul cloud
+    """
+    if not blob_base or not boat_id:
+        return (False, None, 'blob_base/boat_id non configurati')
+    url = (f'{blob_base.rstrip("/")}'
+           f'/{BLOB_CONTAINER_CONFIG}/{boat_id}/{CONFIG_FILE}')
+    try:
+        req = urllib.request.Request(url, headers={
+            'Accept': 'application/json',
+            'User-Agent': 'regolofarm-soar/1.0',
+        })
+        ctx = _SSL_CTX_VERIFIED or ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            if resp.status != 200:
+                return (False, None, f'HTTP {resp.status}')
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        return (False, None, f'HTTP {e.code}')
+    except urllib.error.URLError as e:
+        return (False, None, f'rete: {e.reason}')
+    except socket.timeout:
+        return (False, None, f'timeout dopo {timeout}s')
+    except Exception as e:
+        return (False, None, f'{type(e).__name__}: {e}')
+    try:
+        data = json.loads(raw.decode('utf-8'))
+        if not isinstance(data, dict):
+            return (False, None, 'JSON non e\' un oggetto')
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        return (False, None, f'JSON invalido: {e}')
+    return (True, data, None)
+
+
 def default_config():
     """Restituisce il dict con TUTTI i valori di default dell'applicazione.
 
@@ -699,31 +795,38 @@ def default_config():
         'log_dir':            LOG_PATH,
         # Tattica: finestra TWD per analisi lato buono / vira (minuti)
         'twd_window_minutes': 5,
-        # Cloud upload (snapshot live a backend HTTPS - il backend fa
-        # l'INSERT su SQL Server tabella 'traks' di sailing-sql-7645).
+        # Cloud upload (legacy webhook -- mantenuto per backward-compat)
         'cloud_enabled':      False,
         'cloud_url':          CLOUD_URL_DEFAULT,
         'cloud_boat_id':      BOAT_ID_DEFAULT,
         'cloud_token':        '016WFv2hWiOedqR4v5qgMP30SLRPOp2kWUR-0pBkfPE',
-        # Intervallo upload in secondi. Valori UI ammessi: 30,60,120,300,600.
-        # Min hard floor 30s nel CloudUploader._loop().
-        'cloud_interval_s':   60,
+        'cloud_interval_min': 10,
         # Base URL del servizio cloud (legacy, non piu' usato per download).
         'api_base':           API_BASE_DEFAULT,
-        # === Azure Blob Storage (autenticazione via Shared Key) ===
-        # blob_base: URL base dello storage account.
-        # blob_account_key: chiave master dello storage account (da Azure
-        # Portal > Storage Account > Access Keys). Usata per firmare le
-        # richieste HTTP al blob storage con HMAC-SHA256 (Shared Key auth).
-        # Container usati (sotto-cartella per boat_id):
+        # === Azure Blob Storage (nuovo flusso download/upload) ===
+        # Storage account URL: i container sono 'polars', 'waypoints', 'tracks'.
+        # URL composti come:
         #   {blob_base}/polars/{cloud_boat_id}/polar.json
         #   {blob_base}/waypoints/{cloud_boat_id}/waypoints.json
         #   {blob_base}/tracks/{cloud_boat_id}/{filename}.csv
-        # ATTENZIONE: la chiave da' accesso completo allo storage account.
-        # Non condividere il sailing_config.json con altri tablet/utenti.
         'blob_base':          BLOB_BASE_DEFAULT,
-        'blob_account_key':   ('ruLSMqmQjnqYRQVXrFtmZmfB4JHXU4nRwyy5px7p'
-                               'WplJgsbgHIsTl8mwk7lrxRz8W+Y+UV2zxA+j+ASt/NKXhQ=='),
+        # SAS token (Account SAS) per il container 'tracks'. Da generare nel
+        # portale Azure: Storage account -> Shared access signature -> spunta
+        # Blob + Container + Object, permessi Write + Create (+ Read/List per
+        # download remoto). Esempio:
+        #   sv=2025-11-05&ss=bfqt&srt=sco&sp=rwdlacupyx&se=...&spr=https&sig=...
+        # NB: NON includere il '?' iniziale.
+        # ATTENZIONE SICUREZZA: il SAS hardcoded qui sotto e' visibile a chiunque
+        # decompili l'APK. In produzione metti '' qui e popola il SAS solo via
+        # sailing_config.json sul dispositivo, oppure ruota frequentemente la
+        # chiave di firma.
+        'tracks_sas_token':   'sv=2025-11-05&ss=bfqt&srt=sco&sp=rwdlacupyx&se=2030-05-13T06:08:43Z&st=2026-05-12T21:53:43Z&spr=https&sig=u2i15DR2aWhC7Y2ot1teg%2B0kb%2BwVwj%2FEuhX5Y%2FuwCU8%3D',
+        # SAS token per upload polare/waypoint (Write + Create). I container
+        # 'polars' e 'waypoints' sono in lettura pubblica (no SAS per il GET);
+        # questi token servono SOLO se vuoi caricare al cloud dal tablet.
+        # Lascia stringa vuota se non vuoi abilitare il pulsante upload.
+        'polars_sas_token':    '',
+        'waypoints_sas_token': '',
         # Polare: flag globale ON/OFF. Quando False tutti i calcoli polar-aware
         # (target speed, laylines, ETA, tactical advice on layline) tornano al
         # comportamento "raw" senza polare. La polare resta caricata in memoria,
@@ -888,61 +991,8 @@ def calc_vmg(spd,hdg,brg):
 # =============================================================================
 
 class PolarData:
-    """Modello della polare di una barca + crossover delle vele.
-
-    Formato JSON v1 (legacy, ancora supportato in lettura/scrittura):
-        {
-          "boat_name": "...",
-          "polar": { "tws": { "twa": bsp, ... }, ... }
-        }
-
-    Formato JSON v2 (con crossover vele):
-        {
-          "boat_name": "...",
-          "polar": { ... come sopra ... },
-          "sails": {
-            "definitions": {
-              "Gen+F": {"label": "Genoa + randa full", "color": "#ffe55c"},
-              ...
-            },
-            "crossover": {
-              "tws": { "Beat": "Gen+F", "52": "Gen+F", "60": "Gen+F",
-                       "75": "...", "90": "...", "110": "...", "120": "...",
-                       "135": "...", "150": "...", "Run": "..." },
-              ...
-            }
-          }
-        }
-
-    Backward compat: i polar.json senza sezione 'sails' continuano a
-    funzionare normalmente; in quel caso get_sail() restituisce None.
-    """
-
-    # Bin TWA del crossover. Posizioni: 'Beat'=bolina, 'Run'=poppa piena.
-    # Le chiavi numeriche sono punti TWA in gradi. Ordine importante: TWA
-    # crescente da bolina a poppa.
-    SAIL_BINS = ['Beat', '52', '60', '75', '90', '110', '120', '135', '150', 'Run']
-    # Mappatura bin -> angolo TWA centrale (per il binning di un TWA arbitrario).
-    # 'Beat' usa ~42° (bolina target tipica) e 'Run' usa 180°.
-    _SAIL_BIN_ANGLES = {
-        'Beat': 42.0, '52': 52.0, '60': 60.0, '75': 75.0, '90': 90.0,
-        '110': 110.0, '120': 120.0, '135': 135.0, '150': 150.0, 'Run': 180.0,
-    }
-
     def __init__(self):
-        self.data = {}
-        self.loaded = False
-        self.boat_name = ''
-        # === Crossover vele (v2) ===
-        # sail_definitions: {sail_id: {'label': str, 'color': '#rrggbb'}}
-        self.sail_definitions = {}
-        # sail_crossover: {tws_float: {bin_str: sail_id}}
-        # I bin sono SAIL_BINS (stringhe). tws_float e' float (es. 12.0).
-        self.sail_crossover = {}
-
-    def has_sails(self):
-        """True se il polar.json caricato include la sezione crossover."""
-        return bool(self.sail_definitions and self.sail_crossover)
+        self.data={}; self.loaded=False; self.boat_name=''
 
     def get_tws_list(self): return sorted(self.data.keys())
     def get_twa_list(self):
@@ -988,127 +1038,12 @@ class PolarData:
             if vmg>best: best,btwa=vmg,twa
         return (btwa,best) if btwa else None
 
-    # ---------- Crossover vele ----------
-
-    def _twa_to_bin(self, twa):
-        """Mappa un TWA (gradi, valore assoluto) al bin del crossover piu'
-        vicino. Restituisce una stringa fra SAIL_BINS.
-
-        Strategia: trova il bin con angolo centrale piu' vicino al TWA dato.
-        Tutti i TWA<=42 vanno a 'Beat', TWA>=170 vanno a 'Run'.
-        """
-        twa = abs(float(twa))
-        if twa > 180: twa = 360 - twa
-        # Edge: bolina stretta -> Beat
-        if twa <= self._SAIL_BIN_ANGLES['Beat']:
-            return 'Beat'
-        # Edge: poppa piena -> Run
-        if twa >= 170:
-            return 'Run'
-        # Trova il bin con angolo piu' vicino
-        best_bin = 'Beat'
-        best_dist = 1e9
-        for b in self.SAIL_BINS:
-            d = abs(self._SAIL_BIN_ANGLES[b] - twa)
-            if d < best_dist:
-                best_dist = d
-                best_bin = b
-        return best_bin
-
-    def _crossover_tws_keys(self):
-        """Lista ordinata dei TWS (float) presenti nella tabella crossover."""
-        return sorted(self.sail_crossover.keys())
-
-    def get_sail(self, tws, twa):
-        """Restituisce l'identificativo della vela suggerita per TWS/TWA dati,
-        oppure None se la sezione 'sails' non e' presente nel polar.json
-        oppure se la combinazione non e' coperta dal crossover.
-
-        Logica:
-        - TWA viene mappato al bin piu' vicino fra SAIL_BINS.
-        - Per TWS si sceglie il primo step di vento >= TWS richiesto (pattern
-          standard delle tabelle crossover: la vela cambia quando il vento
-          'sale' a quella soglia). Se TWS >= max, prende l'ultimo step. Se
-          TWS < min, prende il primo step.
-        """
-        if not self.has_sails():
-            return None
-        try:
-            tws_f = float(tws)
-        except (TypeError, ValueError):
-            return None
-        keys = self._crossover_tws_keys()
-        if not keys:
-            return None
-        # Scelta TWS step
-        if tws_f <= keys[0]:
-            tws_key = keys[0]
-        elif tws_f >= keys[-1]:
-            tws_key = keys[-1]
-        else:
-            # primo step >= tws (cambio vela quando il vento 'sale')
-            tws_key = next(k for k in keys if k >= tws_f)
-        bin_str = self._twa_to_bin(twa)
-        return self.sail_crossover.get(tws_key, {}).get(bin_str)
-
-    def get_sail_label(self, sail_id):
-        """Etichetta human-readable di una vela (es. 'Genoa + randa full').
-        Se la vela non e' definita, restituisce sail_id stesso."""
-        if not sail_id: return ''
-        d = self.sail_definitions.get(sail_id)
-        if isinstance(d, dict):
-            return d.get('label') or sail_id
-        return sail_id
-
-    def get_sail_color(self, sail_id):
-        """Colore hex (es. '#ffe55c') di una vela. Default '#888888'."""
-        if not sail_id: return '#888888'
-        d = self.sail_definitions.get(sail_id)
-        if isinstance(d, dict):
-            return d.get('color') or '#888888'
-        return '#888888'
-
-    # ---------- I/O ----------
-
     def load(self,path):
         try:
             with open(path) as f: d=json.load(f)
             self.boat_name=d.get('boat_name','')
             self.data={float(k):{float(ka):float(v) for ka,v in kv.items()}
                        for k,kv in d.get('polar',{}).items()}
-            # === Sails: opzionale, backward-compat con polar.json v1 ===
-            sails = d.get('sails') or {}
-            self.sail_definitions = {}
-            self.sail_crossover = {}
-            if isinstance(sails, dict):
-                defs = sails.get('definitions') or {}
-                if isinstance(defs, dict):
-                    # Validazione minima: ogni voce deve essere dict con
-                    # almeno 'label' o 'color' (o entrambi).
-                    for sail_id, info in defs.items():
-                        if isinstance(info, dict):
-                            self.sail_definitions[str(sail_id)] = {
-                                'label': str(info.get('label', sail_id)),
-                                'color': str(info.get('color', '#888888')),
-                            }
-                cross = sails.get('crossover') or {}
-                if isinstance(cross, dict):
-                    for tws_k, bins in cross.items():
-                        if not isinstance(bins, dict):
-                            continue
-                        try:
-                            tws_f = float(tws_k)
-                        except (TypeError, ValueError):
-                            continue
-                        # Filtro: tieni solo i bin riconosciuti, cosi'
-                        # eventuali chiavi spurie nel JSON non rompono il lookup.
-                        clean = {}
-                        for bin_k, sail_id in bins.items():
-                            bk = str(bin_k)
-                            if bk in self.SAIL_BINS:
-                                clean[bk] = str(sail_id) if sail_id else ''
-                        if clean:
-                            self.sail_crossover[tws_f] = clean
             self.loaded=bool(self.data); return self.loaded
         except Exception as e: print(f'Polar:{e}'); return False
 
@@ -1124,45 +1059,42 @@ class PolarData:
                     for i,tws in enumerate(tws_list):
                         try: self.data[tws][twa]=float(row[i+1].strip())
                         except: pass
-            # CSV non porta info sul crossover: azzera la sezione vele.
-            self.sail_definitions = {}
-            self.sail_crossover = {}
             self.loaded=bool(self.data); return self.loaded
         except Exception as e: print(f'CSV:{e}'); return False
 
     def save(self,path):
-        """Salva la polare. Se sono presenti dati di crossover vele, vengono
-        inclusi nel JSON (formato v2); altrimenti si mantiene il formato v1
-        per compatibilita' con file pre-esistenti."""
-        payload = {
-            'boat_name': self.boat_name,
-            'polar': {str(k):{str(ka):v for ka,v in kv.items()}
-                      for k,kv in self.data.items()},
-        }
-        if self.has_sails():
-            payload['sails'] = {
-                'definitions': dict(self.sail_definitions),
-                'crossover': {str(k): dict(v)
-                              for k, v in self.sail_crossover.items()},
-            }
         with open(path,'w') as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+            json.dump({'boat_name':self.boat_name,
+                       'polar':{str(k):{str(ka):v for ka,v in kv.items()}
+                                for k,kv in self.data.items()}},f,indent=2)
 
 # =============================================================================
 # CLOUD UPLOADER -- invio dati barca a endpoint REST
 # =============================================================================
 
 class CloudUploader:
-    """Invia periodicamente snapshot dei dati barca a un endpoint REST.
+    """Invia periodicamente snapshot dei dati barca al Blob Storage Azure
+    (container 'trackslive'). Ogni snapshot e' UN file JSON separato.
+
+    URL pattern:
+        {blob_base}/trackslive/{cloud_boat_id}/{timestamp}.json?{SAS}
+    Esempio:
+        https://sailingapp.blob.core.windows.net/trackslive/soar/
+        2026-05-13T14-23-05Z.json?sv=...
 
     Caratteristiche:
     - Thread separato: non blocca mai la UI o il parsing NMEA.
     - Buffer offline su file (.jsonl): garantisce zero perdita dati se
-      la rete cellulare e' assente o instabile.
-    - Backoff esponenziale sui retry per non saturare il modem.
+      la rete cellulare e' assente o instabile. Quando la rete torna,
+      ogni record nella coda diventa un file separato nel blob.
     - Force-cellular su Android: bypassa il WiFi senza uplink (caso tipico
       del WiFi di bordo isolato) e usa la SIM dati per HTTPS.
     - Rate limit lato client: max 1 invio "manuale" ogni 60s.
+
+    Cambio architetturale v1.5:
+    - Prima: POST JSON a un endpoint REST (webhook.site / Azure Function).
+    - Adesso: PUT diretto al Blob Storage, riusando il SAS gia' presente
+      per 'tracks'. Niente backend intermedio.
     """
 
     def __init__(self, dm):
@@ -1197,10 +1129,10 @@ class CloudUploader:
     # ----- thread principale -----
 
     def _loop(self):
-        """Loop di upload. Si sveglia ogni `cloud_interval_s` secondi, fa snapshot
+        """Loop di upload. Si sveglia ogni `interval_min` minuti, fa snapshot
         e invia (drenando anche la coda offline)."""
-        # Aspetta 5s al primo avvio per dare tempo al sistema di stabilizzarsi
-        if self._stop.wait(5):
+        # Aspetta 30s al primo avvio per dare tempo al sistema di stabilizzarsi
+        if self._stop.wait(30):
             return
         while not self._stop.is_set():
             try:
@@ -1208,22 +1140,36 @@ class CloudUploader:
             except Exception as e:
                 self.last_error = f'Loop:{e}'
                 print(f'CloudUploader loop:{e}')
-            # Sleep N secondi (configurato in DataManager). Minimo 30s per non
-            # saturare la rete cellulare e per dare al backend tempo di risp.
-            interval_s = max(30, int(self.dm.cloud_interval_s or 60))
+                log_err(f'CloudUploader loop: {e}', exc=e)
+            # Sleep N minuti (configurato in DataManager), interrompibile
+            interval_s = max(60, self.dm.cloud_interval_min * 60)
             if self._stop.wait(interval_s):
                 return
 
     def _upload_cycle(self):
-        """Un ciclo: drena coda offline, poi invia il dato corrente."""
+        """Un ciclo: drena coda offline, poi invia il dato corrente.
+
+        Precondition (nuovo flusso PUT blob 'trackslive'):
+        - cloud_enabled = True
+        - cloud_boat_id non vuoto
+        - tracks_sas_token non vuoto (riusato per il container 'trackslive')
+        - blob_base configurato (di norma sempre, default in default_config)
+        """
         if not self.dm.cloud_enabled:
             return
-        if not self.dm.cloud_url or not self.dm.cloud_boat_id:
-            self.last_error = 'URL o boat_id non configurati'
+        if not self.dm.cloud_boat_id:
+            self.last_error = 'cloud_boat_id non configurato'
+            return
+        if not (self.dm.tracks_sas_token or '').strip():
+            self.last_error = 'tracks_sas_token non configurato'
+            return
+        if not (self.dm.blob_base or '').strip():
+            self.last_error = 'blob_base non configurato'
             return
 
         # 1) Drena la coda offline (max 50 record per ciclo per non
-        # saturare la rete cellulare in caso di accumulo lungo)
+        # saturare la rete cellulare in caso di accumulo lungo).
+        # Ogni record offline diventa un file separato nel blob.
         queued = self._read_queue(max_records=50)
         for rec in queued:
             ok, err = self._post_json(rec)
@@ -1337,28 +1283,43 @@ class CloudUploader:
                 return sum(1 for _ in f if _.strip())
         except: return 0
 
-    # ----- HTTP POST con force-cellular su Android e fallback SSL -----
+    # ----- HTTP PUT al Blob Storage con force-cellular su Android -----
+    #
+    # NOTA SU CAMBIO ARCHITETTURALE (v1.5+):
+    # Prima del v1.5 questo uploader faceva POST JSON a un endpoint REST
+    # (webhook.site o Azure Function). Dal v1.5 fa PUT diretto al container
+    # 'trackslive' del Blob Storage, esattamente come TrackUploader fa con
+    # i CSV in 'tracks'. Vantaggi:
+    # - Niente backend intermedio da mantenere (no Function, no DB).
+    # - Stesso meccanismo SAS gia' collaudato per i CSV.
+    # - Coerente con il resto dell'app (download polar/waypoints via blob).
+    #
+    # Il campo 'cloud_url' nel config e' ora IGNORATO da questo flusso
+    # (resta per compat ma non usato). L'URL e' composto da
+    # DataManager.trackslive_upload_url(filename).
 
     def _post_json(self, payload):
-        """POST JSON al cloud. Restituisce (ok: bool, err: str|None).
-        Su Android forza la rete cellulare se disponibile (bypass WiFi
-        di bordo senza uplink). Se l'errore e' SSL e l'URL e' un servizio
-        di test (webhook.site & co), riprova UNA VOLTA senza verifica."""
-        ok, err = self._post_json_attempt(payload, _SSL_CTX_VERIFIED)
-        if ok:
-            return True, None
-        # Fallback: se errore SSL e URL whitelisted, riprova senza verifica
-        if err and 'SSL' in err.upper() and self._is_test_host(self.dm.cloud_url):
-            if _SSL_CTX_UNVERIFIED is None:
-                return False, f'{err} (fallback non disponibile)'
-            ok2, err2 = self._post_json_attempt(payload, _SSL_CTX_UNVERIFIED)
-            if ok2:
-                # Annoto nel log che il fallback ha funzionato (utile per UI)
-                return True, None
-            return False, f'{err} | retry-noverify: {err2}'
-        return False, err
+        """PUT snapshot JSON al container 'trackslive' del blob storage.
+
+        Filename: timestamp UTC ISO con i ':' sostituiti da '-' (i due punti
+        non sono validi nei nomi blob in alcuni client). Cosi' ogni snapshot
+        finisce in un file separato e non si sovrascrivono mai.
+
+        Restituisce (ok: bool, err: str|None). In caso di errore il chiamante
+        accumula nella coda offline come prima."""
+        # Genera filename univoco per questo snapshot
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
+        filename = f'{ts}.json'
+        url = self.dm.trackslive_upload_url(filename)
+        if not url:
+            return False, ('URL trackslive non componibile: '
+                            'manca tracks_sas_token o cloud_boat_id')
+        return self._put_to_blob_attempt(url, payload, _SSL_CTX_VERIFIED)
 
     def _is_test_host(self, url):
+        """Legacy: usato in passato per il fallback SSL su webhook.site.
+        Mantenuto per compat ma non piu' significativo nel flusso blob
+        (blob.core.windows.net richiede sempre SSL verificato)."""
         try:
             from urllib.parse import urlparse
             host = urlparse(url).hostname or ''
@@ -1366,18 +1327,24 @@ class CloudUploader:
         except Exception:
             return False
 
-    def _post_json_attempt(self, payload, ssl_ctx):
-        """Singolo tentativo HTTP POST con il context SSL fornito."""
+    def _put_to_blob_attempt(self, sas_url, payload, ssl_ctx):
+        """Singolo tentativo PUT al blob storage di UN snapshot JSON.
+
+        Header obbligatori Azure Blob:
+        - x-ms-blob-type: BlockBlob
+        - Content-Type:   application/json
+
+        Su Android forza la rete cellulare se disponibile (bypassa il WiFi
+        di bordo senza uplink).
+        """
         try:
             data = json.dumps(payload).encode('utf-8')
             req = urllib.request.Request(
-                self.dm.cloud_url, data=data,
-                headers={'Content-Type': 'application/json',
-                         'X-Boat-Id': self.dm.cloud_boat_id or '',
-                         'Authorization': f'Bearer {self.dm.cloud_token}'
-                                          if self.dm.cloud_token else ''})
-
-            # Force-cellular su Android se disponibile
+                sas_url, data=data, method='PUT',
+                headers={
+                    'Content-Type':   'application/json',
+                    'x-ms-blob-type': 'BlockBlob',
+                })
             sock_factory = self._cellular_socket_factory()
             if sock_factory:
                 orig = socket.create_connection
@@ -1398,11 +1365,16 @@ class CloudUploader:
                             else f'HTTP {resp.status}')
 
         except ssl.SSLError as e:
-            # Errore SSL diretto: stringa di errore breve e chiara
             reason = getattr(e, 'reason', None) or str(e)
             return False, f'SSL: {reason}'
         except urllib.error.HTTPError as e:
-            return False, f'HTTP {e.code}'
+            # Per il blob storage e' utile vedere il body XML che spiega
+            # AuthenticationFailed / AuthorizationPermissionMismatch / ecc.
+            try:
+                body = e.read().decode('utf-8', errors='replace')[:200]
+            except Exception:
+                body = ''
+            return False, f'HTTP {e.code}: {body}'.strip()
         except urllib.error.URLError as e:
             r = getattr(e, 'reason', e)
             if isinstance(r, ssl.SSLError):
@@ -1490,48 +1462,418 @@ class CloudUploader:
 
 
 # =============================================================================
-# TRACK LOGGER -- scrittura locale del log regata in formato CSV
+# TRACK UPLOADER -- invia file CSV completi al cloud (Azure Blob Storage)
 # =============================================================================
-# Scrive una riga ogni 5 secondi nel file:
-#   {log_dir}/track_YYYY-MM-DD_HH-MM-SS.csv
-# (timestamp = istante di START log).
 #
-# Header CSV: ts_iso,lat,lon,sog_kn,cog,hdg,tws_kn,twa,aws_kn,awa,vmg_kn,depth_m
-# I valori non disponibili sono lasciati vuoti.
+# Differenza con CloudUploader:
+# - CloudUploader invia snapshot LIVE (un dict per ciclo) all'endpoint /api/track.
+# - TrackUploader invia FILE CSV INTERI (chiusi) al Blob Storage Azure direttamente.
 #
-# Lifecycle:
-# - L'utente preme Start -> si crea il file CSV e parte il timer Kivy a 5s.
-# - L'utente preme Stop -> si chiude il file. Il path resta in self._last_path
-#   per consentire l'upload one-shot al blob via UI.
-# - Se l'app va in pausa o esce, on_stop chiude il file (no perdita dati).
-class TrackLogger:
-    """Logger CSV semplice. Una riga ogni 5s, niente upload automatico."""
+# Logica (nuovo flusso, blob diretto):
+# - Quando il TrackLogger ferma un log, chiama track_uploader.enqueue(path).
+# - Il file viene aggiunto a una coda persistente (tracks_to_upload.json).
+# - Un thread di sfondo processa la coda: per ogni file
+#     1. Compone l'URL del blob: {blob_base}/tracks/{boat}/{filename}?{SAS}
+#     2. PUT del CSV direttamente al Blob Storage (header x-ms-blob-type=BlockBlob)
+#     3. Rimuove il file dalla coda se l'upload riesce
+# - Il SAS token e' preconfigurato in sailing_config.json (campo 'tracks_sas_token')
+#   con permessi 'Write' + 'Create' (e 'List' + 'Read' se si vuole anche scarico).
+# - L'utente puo' forzare l'upload dal pulsante "Invia al cloud" nella UI.
+# - Se manca connettivita', il file resta in coda e si riprova al prossimo
+#   ciclo o al prossimo "force_upload".
+# - Niente cancellazione del file CSV locale: resta sempre disponibile per
+#   replay anche dopo upload riuscito (doppia copia: locale + cloud).
+class TrackUploader:
+    """Upload diretto di file CSV ad Azure Blob Storage (container 'tracks').
 
-    INTERVAL_S = 5.0   # frequenza scrittura riga CSV
-    HEADER = ('ts_iso,lat,lon,sog_kn,cog,hdg,'
-              'tws_kn,twa,aws_kn,awa,vmg_kn,depth_m\n')
+    Coda persistente: i file in attesa di upload sono salvati in
+    tracks_to_upload.json (lista di path). Sopravvive a riavvii dell'app.
+    Thread separato: non blocca mai la UI.
+    Force-cellular su Android: riusa la stessa logica di CloudUploader.
+    Espone anche list_remote_tracks() e download_remote_track() per il
+    download dei CSV gia' caricati dal cloud verso il locale.
+    """
+
+    # Pattern URL blob per upload (PUT) e download (GET):
+    #   {blob_base}/tracks/{boat}/{filename}?{tracks_sas_token}
+    # Permessi SAS richiesti:
+    #   - PUT (upload):                Write + Create
+    #   - GET (download remoto):       Read
+    #   - LIST (lista file remoti):    List + Read
 
     def __init__(self, dm):
         self.dm = dm
-        self._fh = None             # file handle aperto in append-text
-        self._path = None           # path del file corrente
-        self._last_path = None      # ultimo file chiuso (per "Invia al cloud")
-        self._cnt = 0               # righe scritte nel log corrente
-        self._started_at = None     # datetime di START
-        self._stopped_at = None     # datetime di STOP
-        self._timer = None          # event Clock di scrittura periodica
+        self._thread = None
+        self._stop = threading.Event()
+        self._wake = threading.Event()  # per svegliare il thread su force_upload
+        self._queue_path = os.path.join(DATA_DIR, 'tracks_to_upload.json')
+        self._queue_lock = threading.Lock()
+        # Counters per UI
+        self.uploaded_count = 0
+        self.last_uploaded_ts = None
+        self.last_error = None
+        self.last_uploaded_filename = None
+
+    # ----- ciclo di vita -----
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def is_running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    # ----- gestione coda persistente -----
+
+    def _read_queue(self):
+        """Legge la coda da disco. Restituisce lista di path (puo' essere vuota)."""
+        try:
+            if not os.path.exists(self._queue_path):
+                return []
+            with open(self._queue_path) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+                return []
+        except Exception as e:
+            print(f'TrackUploader._read_queue: {e}')
+            return []
+
+    def _write_queue(self, paths):
+        """Salva la coda su disco."""
+        try:
+            os.makedirs(os.path.dirname(self._queue_path), exist_ok=True)
+            with open(self._queue_path, 'w') as f:
+                json.dump(paths, f)
+        except Exception as e:
+            print(f'TrackUploader._write_queue: {e}')
+
+    def queue_size(self):
+        """Numero di file in coda (per UI)."""
+        with self._queue_lock:
+            return len(self._read_queue())
+
+    def enqueue(self, csv_path):
+        """Aggiunge un file CSV alla coda di upload. Idempotente.
+        Sveglia il thread cosi' processa subito."""
+        if not csv_path or not os.path.exists(csv_path):
+            return
+        with self._queue_lock:
+            q = self._read_queue()
+            if csv_path not in q:
+                q.append(csv_path)
+                self._write_queue(q)
+        # Sveglia il thread per processare subito
+        self._wake.set()
+
+    def force_upload(self):
+        """Pulsante 'Invia al cloud': sveglia immediatamente il thread.
+        Restituisce (ok, msg) per feedback alla UI.
+
+        Precondition check (nuovo flusso blob diretto):
+        - cloud_enabled = True
+        - cloud_boat_id non vuoto
+        - tracks_sas_token non vuoto (serve per il PUT)
+        """
+        if not self.dm.cloud_enabled:
+            return False, 'Cloud disabilitato (vedi Impostazioni)'
+        if not self.dm.cloud_boat_id:
+            return False, 'cloud_boat_id non configurato'
+        if not (self.dm.tracks_sas_token or '').strip():
+            return False, 'tracks_sas_token non configurato'
+        n = self.queue_size()
+        if n == 0:
+            return False, 'Nessun file in coda di upload'
+        # Wake the thread
+        self._wake.set()
+        return True, f'{n} file in coda, upload in corso...'
+
+    # ----- thread principale -----
+
+    def _loop(self):
+        """Loop di upload. Si sveglia quando _wake e' settato (force o enqueue)
+        oppure ogni 5 minuti come safety net per riprovare upload falliti."""
+        # Aspetta 30s al primo avvio per dare tempo al sistema di stabilizzarsi
+        if self._stop.wait(30):
+            return
+        # All'avvio, processa subito eventuale coda residua
+        self._wake.set()
+
+        while not self._stop.is_set():
+            # Aspetta wake o timeout di 5 min
+            self._wake.wait(timeout=300)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
+            try:
+                self._process_queue()
+            except Exception as e:
+                self.last_error = f'Loop:{e}'
+                print(f'TrackUploader loop: {e}')
+                log_err(f'TrackUploader loop: {e}', exc=e)
+
+    def _process_queue(self):
+        """Tenta upload di tutti i file in coda. Si ferma al primo errore
+        (probabilmente niente connettivita') e riprova al prossimo wake.
+
+        Nuovo flusso: PUT diretto al blob 'tracks/{boat}/{filename}' con SAS
+        token preconfigurato (no piu' richiesta SAS al backend).
+        """
+        if not self.dm.cloud_enabled:
+            return
+        if not self.dm.cloud_boat_id:
+            self.last_error = 'cloud_boat_id non configurato'
+            return
+        if not (self.dm.tracks_sas_token or '').strip():
+            self.last_error = 'tracks_sas_token non configurato'
+            return
+
+        with self._queue_lock:
+            q = self._read_queue()
+
+        if not q:
+            return
+
+        successful = []
+        for path in q:
+            if self._stop.is_set():
+                break
+            ok, err = self._upload_one(path)
+            if ok:
+                successful.append(path)
+                self.uploaded_count += 1
+                self.last_uploaded_ts = time.time()
+                self.last_uploaded_filename = os.path.basename(path)
+                self.last_error = None
+            else:
+                # Errore: probabile mancanza connettivita'. Fermati qui,
+                # i file rimangono in coda per il prossimo tentativo.
+                self.last_error = err
+                print(f'TrackUploader: upload fallito {path}: {err}')
+                break
+
+        # Rimuovi dalla coda i file uploadati con successo
+        if successful:
+            with self._queue_lock:
+                q = self._read_queue()
+                q = [p for p in q if p not in successful]
+                self._write_queue(q)
+
+    def _upload_one(self, csv_path):
+        """Upload di UN file CSV come blob in 'tracks/{boat}/{filename}'.
+
+        Flusso semplificato (no SAS round-trip al backend):
+        1. Compone l'URL del blob con SAS token preconfigurato.
+        2. PUT del CSV con header Azure 'x-ms-blob-type: BlockBlob'.
+
+        Restituisce (ok, err)."""
+        try:
+            if not os.path.exists(csv_path):
+                # File scomparso: lo consideriamo "uploadato" per rimuoverlo dalla coda
+                return True, None
+            filename = os.path.basename(csv_path)
+
+            sas_url = self.dm.track_upload_url(filename)
+            if not sas_url:
+                return False, 'SAS URL non componibile (boat_id/token mancanti)'
+
+            with open(csv_path, 'rb') as f:
+                csv_data = f.read()
+
+            return self._put_to_blob(sas_url, csv_data)
+        except Exception as e:
+            return False, str(e)
+
+    def _put_to_blob(self, sas_url, csv_data):
+        """PUT del contenuto CSV al blob storage. Restituisce (ok, err).
+
+        Header obbligatori per Azure Blob Storage:
+        - x-ms-blob-type: BlockBlob (block blob, non append/page)
+        - Content-Type: text/csv
+        Il SAS token nella query string autentica la richiesta.
+        Su Android forza la rete cellulare se disponibile (riusa CloudUploader).
+        """
+        try:
+            req = urllib.request.Request(
+                sas_url, data=csv_data, method='PUT',
+                headers={
+                    'Content-Type':    'text/csv',
+                    'x-ms-blob-type':  'BlockBlob',
+                })
+            sock_factory = self._cellular_socket_factory()
+            if sock_factory:
+                orig = socket.create_connection
+                socket.create_connection = sock_factory
+                try:
+                    with urllib.request.urlopen(req, timeout=60,
+                                                context=_SSL_CTX_VERIFIED) as resp:
+                        return (resp.status < 300,
+                                None if resp.status < 300 else f'HTTP {resp.status}')
+                finally:
+                    socket.create_connection = orig
+            else:
+                with urllib.request.urlopen(req, timeout=60,
+                                            context=_SSL_CTX_VERIFIED) as resp:
+                    return (resp.status < 300,
+                            None if resp.status < 300 else f'HTTP {resp.status}')
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode('utf-8', errors='replace')[:200]
+            except Exception:
+                body = ''
+            return False, f'HTTP {e.code}: {body}'
+        except Exception as e:
+            return False, str(e)
+
+    def list_remote_tracks(self, timeout=15):
+        """Lista i blob CSV presenti in 'tracks/{boat}/' usando il SAS token
+        (richiede permesso 'List' nel SAS, oltre a 'Read').
+
+        Restituisce (ok, lista_filename) oppure (False, msg_errore).
+        Se il SAS non ha permesso 'list', l'API restituisce 403.
+        """
+        if not self.dm.cloud_boat_id:
+            return False, 'cloud_boat_id non configurato'
+        sas = (self.dm.tracks_sas_token or '').lstrip('?').strip()
+        if not sas:
+            return False, 'tracks_sas_token non configurato'
+        base = (self.dm.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
+        # Endpoint LIST dei blob nel container, filtrato per prefisso boat:
+        #   {base}/{container}?restype=container&comp=list&prefix={boat}/&{sas}
+        prefix = f'{self.dm.cloud_boat_id}/'
+        from urllib.parse import quote
+        list_url = (f'{base}/{BLOB_CONTAINER_TRACKS}'
+                    f'?restype=container&comp=list&prefix={quote(prefix)}&{sas}')
+        try:
+            req = urllib.request.Request(list_url, method='GET')
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=_SSL_CTX_VERIFIED) as resp:
+                if resp.status >= 300:
+                    return False, f'HTTP {resp.status}'
+                xml_body = resp.read().decode('utf-8', errors='replace')
+        except urllib.error.HTTPError as e:
+            return False, f'HTTP {e.code} (serve permesso List nel SAS)'
+        except Exception as e:
+            return False, str(e)
+        # Parse XML minimale: cerco <Name>...</Name>. Il payload Azure ha forma:
+        #   <EnumerationResults><Blobs><Blob><Name>soar/log.csv</Name>...
+        import re
+        names = re.findall(r'<Name>([^<]+)</Name>', xml_body)
+        # Estraggo solo il filename (rimuovo prefisso "{boat}/")
+        files = []
+        for n in names:
+            if n.startswith(prefix):
+                fn = n[len(prefix):]
+                if fn and '/' not in fn:  # ignora eventuali sottocartelle
+                    files.append(fn)
+        return True, files
+
+    def download_remote_track(self, filename, dest_path, timeout=60):
+        """Scarica UN file di track dal blob e lo salva in dest_path.
+        Riusa il SAS token (serve permesso 'Read').
+        Restituisce (ok, err)."""
+        if not filename:
+            return False, 'filename mancante'
+        sas_url = self.dm.track_upload_url(filename)  # stesso URL+SAS, GET method
+        if not sas_url:
+            return False, 'URL non componibile'
+        try:
+            req = urllib.request.Request(sas_url, method='GET')
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=_SSL_CTX_VERIFIED) as resp:
+                if resp.status >= 300:
+                    return False, f'HTTP {resp.status}'
+                data = resp.read()
+            # Scrittura atomica
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            tmp = dest_path + '.tmp'
+            with open(tmp, 'wb') as f:
+                f.write(data)
+                f.flush()
+                try: os.fsync(f.fileno())
+                except: pass
+            os.replace(tmp, dest_path)
+            return True, None
+        except urllib.error.HTTPError as e:
+            return False, f'HTTP {e.code}'
+        except Exception as e:
+            return False, str(e)
+
+    def _cellular_socket_factory(self):
+        """Su Android, restituisce una socket factory che forza la rete
+        cellulare. Riusa la stessa logica di CloudUploader."""
+        # Per non duplicare il codice: deleghiamo all'istanza CloudUploader.
+        # Se non c'e', restituiamo None (no force-cellular).
+        cu = getattr(self.dm, 'cloud', None)
+        if cu and hasattr(cu, '_cellular_socket_factory'):
+            return cu._cellular_socket_factory()
+        return None
+
+
+# =============================================================================
+# DATA MANAGER
+# =============================================================================
+
+# =============================================================================
+# TRACK LOGGER -- scrittura CSV indipendente dalla schermata corrente
+# =============================================================================
+#
+# Logica del logging:
+# - L'utente attiva/disattiva il log dalla schermata Start (toggle button).
+# - Il timer di scrittura e' un Clock.schedule_interval DEDICATO (ogni 5s),
+#   non e' agganciato al tick(dt) della schermata corrente. Cosi' anche se
+#   l'utente passa a Navigation/LayLine/altre schermate, il log continua.
+# - I dati scritti sono quelli che si vedono nella schermata Navigation:
+#   posizione GPS + tutti i campi degli strumenti (vento, profondita',
+#   waypoint target, VMG, TARGET da polare, advice tattico).
+# - Ogni writerow() e' seguito da flush() + fsync(): in caso di crash o
+#   batteria scarica si perdono al massimo gli ultimi 5s.
+# - File CSV creato in DataManager.log_dir (default: <data_dir>/logs/).
+class TrackLogger:
+    """Logger CSV autonomo che scrive ogni LOG_INTERVAL_S secondi i dati di
+    navigazione su file. Indipendente dalla UI: una volta avviato continua
+    finche' non viene fermato esplicitamente, indipendentemente da quale
+    schermata e' visibile."""
+
+    LOG_INTERVAL_S = 5.0   # frequenza scrittura su disco (richiesta utente)
+
+    # Ordine colonne CSV: corrisponde a tutti i campi visibili in Navigation
+    # (i 3 box in alto + bussola/HDG + i 9 box centrali + advice tattico).
+    HEADER = [
+        'Timestamp', 'Lat', 'Lon',
+        'SOG_kn', 'COG_deg', 'HDG_deg',
+        'STW_kn', 'TARGET_kn', 'VMG_kn',
+        'TWS_kn', 'TWA_deg', 'TWD_deg',
+        'AWS_kn', 'AWA_deg',
+        'Depth_m',
+        'BRG_mark_deg', 'DIST_mark_NM', 'ETA_mark_min',
+        'TacticalAdvice', 'Shift_deg',
+    ]
+
+    def __init__(self, dm):
+        self.dm = dm
+        self._active = False
+        self._fh = None
+        self._wr = None
+        self._path = None
+        self._cnt = 0
+        self._event = None       # handle del Clock.schedule_interval
         self._last_error = None
 
+    # ---- API pubblica ----
+
     def is_active(self):
-        return self._fh is not None
+        return self._active
 
     def get_path(self):
-        """Path del file in scrittura (None se non attivo)."""
         return self._path
-
-    def get_last_path(self):
-        """Path dell'ULTIMO file chiuso (None se mai stato fermato)."""
-        return self._last_path
 
     def get_count(self):
         return self._cnt
@@ -1539,88 +1881,131 @@ class TrackLogger:
     def get_last_error(self):
         return self._last_error
 
-    def get_started_at(self):
-        """datetime di start del log corrente, o None se non attivo."""
-        return self._started_at
-
     def start(self):
-        """Apre un nuovo file CSV con timestamp di adesso. Restituisce
-        (ok, path_or_msg)."""
-        if self._fh is not None:
-            return False, 'gia in registrazione'
-        # Path: log_dir/track_YYYY-MM-DD_HH-MM-SS.csv
-        log_dir = self.dm.log_dir or LOG_PATH
+        """Apre un nuovo file CSV in log_dir e schedula la scrittura periodica.
+        Restituisce (ok, msg) per feedback alla UI."""
+        if self._active:
+            return True, 'Log gia attivo'
+        log_dir = self.dm.log_dir
         try:
             os.makedirs(log_dir, exist_ok=True)
         except Exception as e:
-            self._last_error = f'mkdir log_dir: {e}'
+            self._last_error = f'mkdir: {e}'
             return False, self._last_error
-        ts_now = datetime.now()
-        fname = ts_now.strftime('track_%Y-%m-%d_%H-%M-%S.csv')
-        path = os.path.join(log_dir, fname)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(log_dir, f'track_{ts}.csv')
         try:
-            fh = open(path, 'w', encoding='utf-8', newline='')
-            fh.write(self.HEADER)
-            fh.flush()
+            self._fh = open(path, 'w', newline='')
+            self._wr = csv.writer(self._fh)
+            self._wr.writerow(self.HEADER)
+            self._fh.flush()
+            try: os.fsync(self._fh.fileno())
+            except: pass
         except Exception as e:
-            self._last_error = f'open {path}: {e}'
+            self._last_error = f'open: {e}'
+            try:
+                if self._fh: self._fh.close()
+            except: pass
+            self._fh = self._wr = None
             return False, self._last_error
-        self._fh = fh
         self._path = path
         self._cnt = 0
-        self._started_at = ts_now
-        self._stopped_at = None
+        self._active = True
         self._last_error = None
-        # Timer Kivy (esegue sul main thread, non serve lock)
-        self._timer = Clock.schedule_interval(self._tick, self.INTERVAL_S)
-        # Scrivo subito la prima riga
-        self._tick(0)
+        # Schedula il timer dedicato. Cattura un riferimento 'self' nella
+        # lambda cosi' resta vivo finche' l'evento e' schedulato.
+        self._event = Clock.schedule_interval(
+            lambda dt: self._tick(), self.LOG_INTERVAL_S)
+        # Scrivo subito una prima riga cosi' l'utente vede il file popolato
+        # senza dover aspettare 5s.
+        self._tick()
         return True, path
 
     def stop(self):
-        """Chiude il file in modo sicuro. Idempotente: se gia' fermo no-op."""
-        if self._timer is not None:
-            try: self._timer.cancel()
-            except Exception: pass
-            self._timer = None
-        if self._fh is not None:
-            try:
+        """Ferma il timer e chiude il file. Idempotente.
+        Se il TrackUploader e' configurato, accoda il file CSV per upload
+        automatico al cloud (Azure Blob Storage)."""
+        if not self._active:
+            return
+        self._active = False
+        try:
+            if self._event is not None:
+                self._event.cancel()
+        except Exception:
+            pass
+        self._event = None
+        closed_path = self._path
+        try:
+            if self._fh:
                 self._fh.flush()
                 try: os.fsync(self._fh.fileno())
                 except: pass
                 self._fh.close()
-            except Exception as e:
-                self._last_error = f'close: {e}'
-            self._last_path = self._path
-            self._fh = None
-            self._path = None
-            self._stopped_at = datetime.now()
+        except Exception as e:
+            self._last_error = f'close: {e}'
+        self._fh = self._wr = None
 
-    def _tick(self, dt):
-        """Scrive UNA riga col snapshot corrente. Resta no-op se file chiuso."""
-        if self._fh is None:
-            return
+        # Accoda per upload al cloud se l'uploader e' configurato
         try:
-            dm = self.dm
-            ts = datetime.now().isoformat(timespec='seconds')
-            def fmt(v, prec=2):
-                return f'{v:.{prec}f}' if v is not None else ''
-            row = (
-                f'{ts},'
-                f'{fmt(dm.gps_lat, 6)},'
-                f'{fmt(dm.gps_lon, 6)},'
-                f'{fmt(dm.boat_speed, 2)},'
-                f'{fmt(dm.boat_course, 1)},'
-                f'{fmt(dm.boat_heading, 1)},'
-                f'{fmt(dm.true_wind_speed, 2)},'
-                f'{fmt(dm.true_wind_angle, 1)},'
-                f'{fmt(dm.apparent_wind_speed, 2)},'
-                f'{fmt(dm.apparent_wind_angle, 1)},'
-                f'{fmt(dm.vmg, 2)},'
-                f'{fmt(dm.depth, 1)}'
-                f'\n')
-            self._fh.write(row)
+            tu = getattr(self.dm, 'track_uploader', None)
+            if tu and closed_path and self._cnt > 0:
+                tu.enqueue(closed_path)
+        except Exception as e:
+            print(f'TrackLogger.stop: enqueue failed: {e}')
+
+    # ---- interno ----
+
+    def _tick(self):
+        """Callback del timer: scrive una riga CSV con i dati correnti del
+        DataManager. Protetto da try/except cosi' un errore di scrittura
+        non interrompe il timer (continueremo a riprovare ogni 5s)."""
+        if not self._active or self._wr is None or self._fh is None:
+            return
+        dm = self.dm
+        try:
+            # Calcolo ETA stimato verso la boa target (in minuti).
+            eta_min = ''
+            if (dm.distance_to_mark is not None
+                    and dm.boat_speed is not None
+                    and dm.boat_speed > 0.1):
+                eta_min = f'{(dm.distance_to_mark / dm.boat_speed) * 60:.1f}'
+            # TWD medio (direzione vento vera) e advice tattico
+            try:
+                twd = dm.get_twd_average()
+            except Exception:
+                twd = None
+            try:
+                advice, shift = dm.tactical_advice()
+            except Exception:
+                advice, shift = (None, None)
+            row = [
+                datetime.now().isoformat(timespec='seconds'),
+                f'{dm.gps_lat:.6f}'              if dm.gps_lat              is not None else '',
+                f'{dm.gps_lon:.6f}'              if dm.gps_lon              is not None else '',
+                f'{dm.boat_speed:.2f}',
+                f'{dm.boat_course:.1f}',
+                f'{dm.boat_heading:.1f}',
+                f'{dm.boat_speed:.2f}',                                       # STW = SOG (no log separato)
+                f'{dm.target_bsp:.2f}'           if dm.target_bsp           is not None else '',
+                f'{dm.vmg:.2f}'                  if dm.vmg                  is not None else '',
+                f'{dm.true_wind_speed:.1f}'      if dm.true_wind_speed      else '',
+                f'{dm.true_wind_angle:.1f}'      if dm.true_wind_angle      else '',
+                f'{twd:.1f}'                     if twd                     is not None else '',
+                f'{dm.apparent_wind_speed:.1f}'  if dm.apparent_wind_speed  else '',
+                f'{dm.apparent_wind_angle:.1f}'  if dm.apparent_wind_angle  else '',
+                f'{dm.depth:.1f}',
+                f'{dm.bearing_to_mark:.1f}'      if dm.bearing_to_mark      is not None else '',
+                f'{dm.distance_to_mark:.3f}'     if dm.distance_to_mark     is not None else '',
+                eta_min,
+                advice or '',
+                f'{shift:.1f}'                   if shift                   is not None else '',
+            ]
+            self._wr.writerow(row)
+            # flush+fsync ogni scrittura: a 5s di intervallo l'overhead e'
+            # trascurabile e protegge dal data loss su crash/batteria.
             self._fh.flush()
+            try: os.fsync(self._fh.fileno())
+            except: pass
             self._cnt += 1
             self._last_error = None
         except Exception as e:
@@ -1725,16 +2110,18 @@ class DataManager:
                     print(f'  polar.json riscritto con default e ricaricato')
             except Exception as e:
                 print(f'  fallback polar ERROR: {type(e).__name__}: {e}')
-        # CloudUploader: lo creo sempre, viene avviato solo se cloud_enabled=True.
-        # Manda snapshot live (un POST ogni cloud_interval_s secondi) al backend
-        # HTTPS, che a sua volta INSERT su SQL Server tabella 'traks' di
-        # sailing-sql-7645.database.windows.net.
+        # CloudUploader: lo creo sempre, viene avviato solo se cloud_enabled=True
         self.cloud = CloudUploader(self)
         if self.cloud_enabled:
             self.cloud.start()
-        # TrackLogger: scrittura locale CSV una riga ogni 5s. Avviato/fermato
-        # manualmente dalla LoggingScreen.
+        # TrackLogger: scrittura CSV ogni 5s, indipendente dalla schermata
+        # corrente. Non viene avviato in automatico: l'utente lo attiva dal
+        # pulsante "Avvia log" nella schermata Start.
         self.track_logger = TrackLogger(self)
+        # TrackUploader: invia file CSV al cloud (Azure Blob Storage).
+        # Si avvia sempre cosi' processa eventuale coda residua all'apertura.
+        self.track_uploader = TrackUploader(self)
+        self.track_uploader.start()
 
     def _apply_config(self, c):
         """Applica un dict di configurazione agli attributi del DataManager.
@@ -1753,17 +2140,8 @@ class DataManager:
         bid = (c.get('cloud_boat_id', '') or '').strip()
         self.cloud_boat_id      = bid if bid else BOAT_ID_DEFAULT
         self.cloud_token        = c.get('cloud_token',   '')
-        # Intervallo upload in secondi. Migrazione automatica dal vecchio
-        # 'cloud_interval_min' (minuti) se presente in config legacy.
-        cs = c.get('cloud_interval_s')
-        if cs is None:
-            # Legacy: accetta cloud_interval_min e converti
-            cm = c.get('cloud_interval_min')
-            cs = (cm * 60) if cm else 60
-        # Whitelist di valori UI: 30s, 1m, 2m, 5m, 10m
-        try: cs = int(cs)
-        except (TypeError, ValueError): cs = 60
-        self.cloud_interval_s = cs if cs in (30, 60, 120, 300, 600) else 60
+        ci = c.get('cloud_interval_min', 10)
+        self.cloud_interval_min = ci if ci in (5, 10, 15, 30) else 10
         # Base URL del servizio cloud (legacy, mantenuto per compat config).
         # Retrocompatibilita': accetta anche il vecchio nome
         # 'waypoints_api_base' usato in versioni precedenti.
@@ -1773,16 +2151,10 @@ class DataManager:
         # === Azure Blob Storage ===
         bb = (c.get('blob_base', '') or '').strip().rstrip('/')
         self.blob_base = bb if bb else BLOB_BASE_DEFAULT
-        # blob_account_key: chiave master dello storage account, usata per
-        # firmare le richieste con Shared Key (HMAC-SHA256). Se vuota, le
-        # operazioni cloud (upload/download tracks, upload polari/waypoints)
-        # falliranno con "blob_account_key non configurata".
-        self.blob_account_key = (c.get('blob_account_key', '') or '').strip()
-        # === Backward-compat con config v1.7-1.9 (SAS token) ===
-        # Se il config ha ancora i vecchi tracks_sas_token/polars/waypoints
-        # li leggiamo per non rompere setup esistenti, ma il flusso primario
-        # usa blob_account_key. Vengono ignorati nei nuovi flussi.
-        self.tracks_sas_token    = (c.get('tracks_sas_token',    '') or '').strip()
+        # SAS token per il container 'tracks' (solo upload). Lo storiamo cosi'
+        # come arriva dal config; il leading '?' viene rimosso al momento dell'uso.
+        self.tracks_sas_token = (c.get('tracks_sas_token', '') or '').strip()
+        # SAS opzionali per upload polare/waypoints (vuoto = upload disabilitato).
         self.polars_sas_token    = (c.get('polars_sas_token',    '') or '').strip()
         self.waypoints_sas_token = (c.get('waypoints_sas_token', '') or '').strip()
         # Polare ON/OFF: default True per non rompere comportamento esistente
@@ -1818,25 +2190,69 @@ class DataManager:
         self.target_mark = c.get('target_mark', None) or None
 
     def _load_cfg(self):
-        """Carica config da file. Se il file non esiste, lo crea con i default
-        cosi' al primo avvio l'utente trova un sailing_config.json gia' pronto
-        e popolato dai valori di default_config().
+        """Carica config con strategia a tre livelli di fallback.
 
-        Se il file esiste ma proviene da una versione precedente dell'app che
-        non aveva tutti i campi attuali (es. 'api_base' aggiunto in una nuova
-        versione), il loader rileva i campi mancanti e RISCRIVE il file con
-        i default per i nuovi campi. Cosi' l'utente trova sempre tutti i campi
-        nel file dopo il primo avvio della nuova versione, senza dover
-        toccare manualmente le impostazioni perche' venga rigenerato."""
+        Gerarchia (la prima fonte che risponde, vince):
+          1) sailing_config.json LOCALE (DATA_DIR/sailing_config.json)
+             -> caso normale, dopo il primo avvio.
+          2) sailing_config.json CLOUD (blob storage container 'config')
+             -> URL: {blob_base}/config/{boat_id}/sailing_config.json
+             -> caso "factory provisioning": nuovo tablet al primo avvio
+                scarica la sua config dal cloud automaticamente.
+          3) default_config() hardcoded nel codice
+             -> caso "primo avvio + niente cloud": l'app parte comunque
+                con valori sensati.
+
+        Dopo il caricamento da cloud o da default, il file viene SEMPRE
+        scritto su disco in locale. Cosi':
+          - i prossimi avvii usano direttamente il file locale (livello 1);
+          - l'utente puo' editare il config sul tablet senza che venga
+            sovrascritto da remoto.
+
+        Se il file locale ESISTE ma proviene da una versione precedente
+        dell'app che non aveva tutti i campi attuali, vengono aggiunti i
+        nuovi campi con i default (migrazione automatica).
+        """
         if not os.path.exists(self.config_path):
-            # Primo avvio: il file non c'e'. I default sono gia' applicati
-            # in __init__ via _apply_config(default_config()), quindi basta
-            # persisterli su disco.
-            try:
-                self.save_cfg()
-                print(f'Config creato con default in {self.config_path}')
-            except Exception as e:
-                print(f'_load_cfg create-default ERROR: {type(e).__name__}: {e}')
+            # Primo avvio: niente file locale. Provo il cloud, poi default.
+            #
+            # Per il fetch cloud uso i valori CORRENTI di self.blob_base e
+            # self.cloud_boat_id, che sono gia' stati popolati in __init__
+            # da _apply_config(default_config()). Quindi blob_base punta a
+            # BLOB_BASE_DEFAULT e boat_id a BOAT_ID_DEFAULT ('soar') salvo
+            # override compilati nei default.
+            print(f'_load_cfg: file locale assente ({self.config_path}), '
+                  'tento fetch da cloud...')
+            ok, cloud_cfg, err = fetch_remote_config(
+                self.blob_base, self.cloud_boat_id)
+            if ok:
+                try:
+                    self._apply_config(cloud_cfg)
+                    # Migrazione: aggiungo eventuali campi mancanti dal config
+                    # remoto (es. cloud ha versione vecchia, codice ha nuovi
+                    # campi). _apply_config ha gia' usato i default per i
+                    # campi mancanti; save_cfg() persistera' il merge.
+                    self.save_cfg()
+                    print('_load_cfg: config CLOUD scaricato e salvato in '
+                          f'{self.config_path}')
+                except Exception as e:
+                    print(f'_load_cfg: cloud OK ma apply/save ERROR: '
+                          f'{type(e).__name__}: {e}')
+                    # Fallback estremo: i default sono gia' applicati in
+                    # __init__, provo almeno a persistere quelli.
+                    try: self.save_cfg()
+                    except Exception as e2:
+                        print(f'_load_cfg fallback save ERROR: {e2}')
+            else:
+                print(f'_load_cfg: cloud non disponibile ({err}), '
+                      'uso default hardcoded')
+                # I default sono gia' applicati in __init__, basta persisterli.
+                try:
+                    self.save_cfg()
+                    print(f'Config creato con default in {self.config_path}')
+                except Exception as e:
+                    print(f'_load_cfg create-default ERROR: '
+                          f'{type(e).__name__}: {e}')
             return
         try:
             with open(self.config_path) as f:
@@ -1846,8 +2262,9 @@ class DataManager:
             # campi previsti dalla versione corrente di default_config(), li
             # aggiungiamo (con i default) riscrivendo il file. Questo accade
             # quando l'utente aggiorna l'app a una versione che introduce
-            # nuovi campi (es. 'blob_account_key' aggiunto nella v1.10 per
-            # autenticazione Shared Key).
+            # nuovi campi (es. 'api_base', 'blob_base', 'tracks_sas_token',
+            # 'polars_sas_token', 'waypoints_sas_token' aggiunti per il
+            # passaggio ad Azure Blob Storage diretto).
             # NB: il valore di 'cloud_boat_id' NON viene rimpiazzato: se il
             # config aveva 'regolofarm-1', resta tale. Per usare 'soar' va
             # cambiato esplicitamente da Settings o nel file.
@@ -1915,10 +2332,12 @@ class DataManager:
                    'cloud_url':          self.cloud_url,
                    'cloud_boat_id':      self.cloud_boat_id,
                    'cloud_token':        self.cloud_token,
-                   'cloud_interval_s':   self.cloud_interval_s,
+                   'cloud_interval_min': self.cloud_interval_min,
                    'api_base':           self.api_base,
                    'blob_base':          self.blob_base,
-                   'blob_account_key':   self.blob_account_key,
+                   'tracks_sas_token':   self.tracks_sas_token,
+                   'polars_sas_token':    self.polars_sas_token,
+                   'waypoints_sas_token': self.waypoints_sas_token,
                    'polar_enabled':      self.polar_enabled,
                    'waypoints':          self._serialize_waypoints(),
                    'target_mark':        self.target_mark}
@@ -2033,116 +2452,80 @@ class DataManager:
         base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
         return f'{base}/{BLOB_CONTAINER_POLARS}/{self.cloud_boat_id}/{POLAR_FILE}'
 
-    def download_meteo_url(self):
-        """URL completo da cui scaricare il file forecast.json delle previsioni
-        meteo per la regata.
+    def track_blob_url(self, filename):
+        """URL completo del blob per UN file di track (CSV).
 
-        Pattern: {blob_base}/meteo/{cloud_boat_id}/forecast.json
+        Pattern: {blob_base}/tracks/{cloud_boat_id}/{filename}
         Esempio:
-            https://sailingapp.blob.core.windows.net/meteo/soar/forecast.json
+            https://sailingapp.blob.core.windows.net/tracks/soar/log_2026-05-05.csv
 
-        Il file viene generato dal backend (script periodico che chiama
-        Open-Meteo) e contiene previsioni gia' pre-elaborate per i waypoint
-        della barca. Il formato JSON e' descritto nella WeatherScreen.
-
-        Restituisce None se boat_id o blob_base non configurati."""
-        if not self.cloud_boat_id:
+        L'upload richiede SAS token (vedi tracks_sas_token); la GET richiede
+        SAS o lettura pubblica. Restituisce None se manca config."""
+        if not self.cloud_boat_id or not filename:
             return None
         base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
-        return f'{base}/{BLOB_CONTAINER_METEO}/{self.cloud_boat_id}/{METEO_FILE}'
-
-    # Nota: track_blob_url(), track_upload_url() e tutto il flusso di upload
-    # tracks CSV automatico via TrackUploader sono stati rimossi nella v1.17.
-    # Resta il metodo upload_csv_to_blob() per upload one-shot manuale via
-    # pulsante "Invia al cloud" della LoggingScreen (v1.18).
-
-    def upload_csv_to_blob(self, csv_path, timeout=60):
-        """Upload one-shot di un file CSV al blob storage.
-        Pattern URL: {blob_base}/tracks/{cloud_boat_id}/{filename}
-        Restituisce (ok, msg).
-
-        Usa Shared Key auth. Sicuro perche' la firma HMAC-SHA256 e' calcolata
-        sui contenuti, anche senza TLS verification l'integrita' e' garantita."""
-        if not os.path.exists(csv_path):
-            return False, f'File non trovato: {csv_path}'
-        if not self.cloud_boat_id:
-            return False, 'cloud_boat_id non configurato'
-        account_key = (self.blob_account_key or '').strip()
-        if not account_key:
-            return False, 'blob_account_key non configurata'
-        base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
-        account_name = _account_name_from_blob_base(base)
-        if not account_name:
-            return False, 'blob_base non valido'
-        try:
-            with open(csv_path, 'rb') as f:
-                csv_data = f.read()
-        except Exception as e:
-            return False, f'lettura file: {type(e).__name__}: {e}'
+        # Encode minimo del filename: spazi, ma di norma sono safe i timestamp
         from urllib.parse import quote
-        filename = os.path.basename(csv_path)
         safe = quote(filename, safe='._-')
-        url = f'{base}/{BLOB_CONTAINER_TRACKS}/{self.cloud_boat_id}/{safe}'
-        try:
-            req = urllib.request.Request(
-                url, data=csv_data, method='PUT',
-                headers={'Content-Type': 'text/csv',
-                         'x-ms-blob-type': 'BlockBlob'})
-            azure_sign_request(req, account_name, account_key)
-            with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
-                if resp.status >= 300:
-                    return False, f'HTTP {resp.status}'
-            kb = len(csv_data) // 1024
-            return True, f'Inviato: {filename} ({kb} KB)'
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode('utf-8', errors='replace')[:200]
-            except Exception:
-                body = ''
-            return False, f'HTTP {e.code}: {body[:120]}'
-        except urllib.error.URLError as e:
-            return False, f'rete: {e.reason}'
-        except socket.timeout:
-            return False, f'timeout dopo {timeout}s'
-        except Exception as e:
-            return False, f'{type(e).__name__}: {e}'
+        return f'{base}/{BLOB_CONTAINER_TRACKS}/{self.cloud_boat_id}/{safe}'
+
+    def track_upload_url(self, filename):
+        """URL con SAS token per fare PUT del file CSV nel container 'tracks'.
+        Restituisce None se SAS token o boat_id non configurati."""
+        base_url = self.track_blob_url(filename)
+        if not base_url:
+            return None
+        sas = (self.tracks_sas_token or '').lstrip('?').strip()
+        if not sas:
+            return None
+        return f'{base_url}?{sas}'
+
+    def trackslive_upload_url(self, filename):
+        """URL con SAS token per fare PUT di UN file di snapshot live (JSON)
+        nel container 'trackslive'.
+
+        Pattern: {blob_base}/trackslive/{cloud_boat_id}/{filename}?{SAS}
+        Esempio:
+            https://sailingapp.blob.core.windows.net/trackslive/soar/
+            2026-05-13T14-23-05Z.json?sv=...
+
+        Usato da CloudUploader per gli snapshot periodici (ogni N minuti).
+        Riusa lo STESSO SAS del container 'tracks' (tracks_sas_token), ma
+        questo richiede che il SAS sia un Account SAS o che siano stati
+        generati permessi cross-container.
+
+        Note:
+        - Se il SAS e' un Container SAS (sr=c) limitato a 'tracks', servira'
+          un SAS dedicato per 'trackslive' (campo separato, da aggiungere se
+          servisse). Per Account SAS (ss=b, srt=co) funziona out-of-the-box.
+        - Il container 'trackslive' NON deve essere pubblico in lettura:
+          i dati di posizione live sono sensibili. Lettura solo via SAS.
+
+        Restituisce None se SAS o boat_id mancanti, o se filename vuoto."""
+        if not self.cloud_boat_id or not filename:
+            return None
+        sas = (self.tracks_sas_token or '').lstrip('?').strip()
+        if not sas:
+            return None
+        base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
+        from urllib.parse import quote
+        safe = quote(filename, safe='._-')
+        return (f'{base}/{BLOB_CONTAINER_TRACKSLIVE}/'
+                f'{self.cloud_boat_id}/{safe}?{sas}')
 
     def _http_get_json(self, url, timeout=15):
         """Helper centrale per le GET HTTPS che restituiscono JSON.
         Restituisce (ok, data_or_msg). Cattura TUTTI gli errori comuni
         (rete, timeout, HTTP, JSON, encoding) e li trasforma in messaggi
         leggibili. Usato sia da download_waypoints sia da download_polar
-        per evitare duplicazione.
-
-        Auto-firma Shared Key: se l'URL punta al blob storage configurato
-        (self.blob_base) E blob_account_key e' settata, aggiunge gli header
-        Azure (x-ms-date, x-ms-version, Authorization). Altrimenti GET in
-        chiaro (caso legacy api_base o container pubblici).
-
-        SSL fallback automatico: per URL del blob storage, in caso di errore
-        di verifica certificato (tipico su Android puro senza CA bundle),
-        ritenta automaticamente con context unverified. Sicuro perche' le
-        richieste blob sono firmate HMAC-SHA256 sui contenuti (Shared Key)."""
+        per evitare duplicazione."""
         try:
             req = urllib.request.Request(url, headers={
                 'Accept': 'application/json',
                 'User-Agent': 'regolofarm-soar/1.0',
             })
-            # Se URL e' del blob storage configurato e abbiamo la chiave,
-            # firma con Shared Key. Altrimenti procedi senza auth.
-            blob_base = (self.blob_base or '').strip().rstrip('/')
-            account_key = (self.blob_account_key or '').strip()
-            if blob_base and account_key and url.startswith(blob_base):
-                account_name = _account_name_from_blob_base(blob_base)
-                if account_name:
-                    try:
-                        azure_sign_request(req, account_name, account_key)
-                    except Exception as e:
-                        # Firma fallita: probabile chiave malformata. Lascio
-                        # andare la richiesta unsigned: se il container e'
-                        # pubblico funziona comunque.
-                        print(f'_http_get_json: firma Shared Key fallita: {e}')
-            with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                 status = resp.getcode()
                 if status != 200:
                     return (False, f'HTTP {status}')
@@ -2283,16 +2666,91 @@ class DataManager:
         boat = self.polar.boat_name or '(senza nome)'
         n_tws = len(self.polar.get_tws_list())
         n_twa = len(self.polar.get_twa_list())
-        sails_info = ''
-        if self.polar.has_sails():
-            n_def = len(self.polar.sail_definitions)
-            sails_info = f' + crossover ({n_def} vele)'
-        return (True, f'Polare "{boat}" scaricata ({n_tws} TWS x {n_twa} TWA){sails_info}')
+        return (True, f'Polare "{boat}" scaricata ({n_tws} TWS x {n_twa} TWA)')
 
-    # Nota: i metodi upload_waypoints_to_cloud/upload_polar_to_cloud/_put_blob
-    # sono stati rimossi nella v1.12 (pulsanti UI eliminati). Idem TrackLogger
-    # e TrackUploader e relative funzioni sono stati rimossi nella v1.17
-    # insieme alla schermata Logging.
+    # ----- Upload waypoints / polar al blob storage -----
+    # I container 'waypoints' e 'polars' sono in lettura pubblica, quindi il
+    # download (GET) non richiede credenziali. L'upload (PUT) richiede invece
+    # un SAS token con permessi Write+Create, configurato nei campi
+    # 'waypoints_sas_token' / 'polars_sas_token' del sailing_config.json.
+
+    def _put_blob(self, container, sas_token, filename, payload_bytes,
+                  content_type='application/json', timeout=30):
+        """Helper interno: PUT del payload nel blob {blob_base}/{container}/
+        {boat_id}/{filename} usando il SAS token specificato.
+        Restituisce (ok, msg)."""
+        if not self.cloud_boat_id:
+            return (False, 'cloud_boat_id non configurato')
+        sas = (sas_token or '').lstrip('?').strip()
+        if not sas:
+            return (False, f'SAS token per {container} non configurato')
+        from urllib.parse import quote
+        base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
+        safe = quote(filename, safe='._-')
+        url = f'{base}/{container}/{self.cloud_boat_id}/{safe}?{sas}'
+        try:
+            req = urllib.request.Request(
+                url, data=payload_bytes, method='PUT',
+                headers={
+                    'Content-Type':   content_type,
+                    'x-ms-blob-type': 'BlockBlob',
+                })
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                if resp.status >= 300:
+                    return (False, f'HTTP {resp.status}')
+            return (True, None)
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode('utf-8', errors='replace')[:200]
+            except Exception:
+                body = ''
+            return (False, f'HTTP {e.code}: {body}')
+        except urllib.error.URLError as e:
+            return (False, f'rete: {e.reason}')
+        except socket.timeout:
+            return (False, f'timeout dopo {timeout}s')
+        except Exception as e:
+            return (False, f'{type(e).__name__}: {e}')
+
+    def upload_waypoints_to_cloud(self):
+        """Carica il file waypoints.json LOCALE (WAYPOINTS_PATH) sul blob
+        'waypoints/{boat_id}/waypoints.json'. Restituisce (ok, msg).
+
+        Richiede waypoints_sas_token con permessi Write+Create."""
+        if not os.path.exists(WAYPOINTS_PATH):
+            return (False, f'File locale non trovato: {WAYPOINTS_PATH}')
+        try:
+            with open(WAYPOINTS_PATH, 'rb') as f:
+                payload = f.read()
+        except Exception as e:
+            return (False, f'lettura file: {type(e).__name__}: {e}')
+        ok, err = self._put_blob(BLOB_CONTAINER_WAYPOINTS,
+                                 self.waypoints_sas_token,
+                                 WAYPOINTS_FILE, payload)
+        if ok:
+            return (True, f'{len(self.waypoints)} waypoint caricati')
+        return (False, err)
+
+    def upload_polar_to_cloud(self):
+        """Carica il file polar.json LOCALE (self.polar_path) sul blob
+        'polars/{boat_id}/polar.json'. Restituisce (ok, msg).
+
+        Richiede polars_sas_token con permessi Write+Create."""
+        if not os.path.exists(self.polar_path):
+            return (False, f'File locale non trovato: {self.polar_path}')
+        try:
+            with open(self.polar_path, 'rb') as f:
+                payload = f.read()
+        except Exception as e:
+            return (False, f'lettura file: {type(e).__name__}: {e}')
+        ok, err = self._put_blob(BLOB_CONTAINER_POLARS,
+                                 self.polars_sas_token,
+                                 POLAR_FILE, payload)
+        if ok:
+            boat = self.polar.boat_name or '(senza nome)'
+            return (True, f'Polare "{boat}" caricata')
+        return (False, err)
 
     def save_waypoints_json(self):
         """Salva self.waypoints in waypoints.json (scrittura atomica).
@@ -3258,41 +3716,20 @@ class NavigationScreen(TabScreen):
             pct=dm.boat_speed/dm.target_bsp*100
             col=GREEN if pct>=95 else ORANGE
             self.b_tgt.set_value(f'{dm.target_bsp:.1f}',col)
-            # Vela suggerita dal crossover (se polare v2 con sezione 'sails').
-            # Append non invasivo: niente cambia se la polare e' v1.
-            sail_id = None
-            if (dm.polar.has_sails() and dm.true_wind_speed
-                    and dm.true_wind_angle is not None):
-                sail_id = dm.polar.get_sail(dm.true_wind_speed,
-                                              dm.true_wind_angle)
-            sail_str = f'  [{sail_id}]' if sail_id else ''
-            self._polar_lbl.text=(f'{dm.polar.boat_name}  '
-                                   f'{dm.target_bsp:.1f}kn  ({pct:.0f}%)'
-                                   f'{sail_str}')
+            self._polar_lbl.text=f'{dm.polar.boat_name}  {dm.target_bsp:.1f}kn  ({pct:.0f}%)'
             self._polar_lbl.color=col
         else:
-            # 3 casi distinti per la label di stato:
-            # 1. polare non caricata        -> "NON CARICATA" (rosso)
-            # 2. polare caricata ma toggle OFF -> "DISATTIVATA" (arancio)
-            # 3. polare ATTIVA ma manca dato vento NMEA -> "Attesa vento NMEA" (grigio)
-            # Senza il caso 3 distinto, l'app diceva DISATTIVATA anche con la
-            # polare ON ogni volta che il router NMEA non spediva True Wind,
-            # confondendo l'utente.
+            # Polare assente o disattivata: NON inventiamo un target fittizio,
+            # lo segnaliamo chiaramente con '--' e label colorata. Distinguiamo
+            # i due casi cosi' l'utente sa se serve caricare un file o
+            # riattivare il toggle nella PolarScreen.
             self.b_tgt.set_value('--', RED)
             if not dm.polar.loaded:
                 self._polar_lbl.text='Polare: NON CARICATA - target N/D'
                 self._polar_lbl.color=RED
-            elif not dm.polar_enabled:
+            else:
                 self._polar_lbl.text='Polare: DISATTIVATA - target N/D'
                 self._polar_lbl.color=ORANGE
-            else:
-                # Polare attiva ma niente target_bsp -> in attesa di TWS/TWA
-                # validi dall'NMEA. Mostro nome barca per confermare che la
-                # polare e' caricata e attiva.
-                boat = dm.polar.boat_name or '(senza nome)'
-                self._polar_lbl.text=(f'{boat}  ATTIVA  -- '
-                                       f'attesa vento NMEA')
-                self._polar_lbl.color=MUTED
         if dm.vmg is not None:
             self.b_vmg.set_value(f'{dm.vmg:.1f}',GREEN if dm.vmg>0 else RED)
         if dm.true_wind_speed:     self.b_tws.set_value(f'{dm.true_wind_speed:.1f}')
@@ -3344,10 +3781,24 @@ class StartLineScreen(TabScreen):
         for m in (1,3,5,10):
             s=m*60; prev.add_widget(mk_btn(f'{m}m',lambda s=s:self._set(s),sp(20)))
         left.add_widget(prev)
-        # NOTA: il blocco "log + invia al cloud" e' stato rimosso nella v1.17
-        # insieme alla schermata Logging. Il tablet non scrive piu' tracks CSV
-        # ne' fa upload al cloud. Per registrare i log delle uscite usa il
-        # plotter di bordo o un'altra app dedicata.
+        # ---- Toggle logging CSV ----
+        # Pulsante che attiva/disattiva il TrackLogger del DataManager.
+        # L'etichetta e il colore cambiano in base allo stato:
+        #   - "Avvia log"   (grigio) quando inattivo
+        #   - "Ferma log"   (rosso)  quando attivo
+        # Una piccola label sotto mostra il path del file e il conteggio righe
+        # cosi' l'utente ha conferma visiva che il log sta lavorando anche
+        # mentre resta sulla schermata Start.
+        log_box=BoxLayout(orientation='vertical',spacing=dp(4),
+                          size_hint_y=None,height=dp(120))
+        self._log_btn=mk_btn('Avvia log',self._toggle_log,sp(22))
+        log_box.add_widget(self._log_btn)
+        self._log_status=Label(text='Log non attivo',font_size=sp(15),
+                                color=MUTED,size_hint_y=None,height=dp(40),
+                                halign='center',valign='middle')
+        self._log_status.bind(size=lambda l,_: setattr(l,'text_size',l.size))
+        log_box.add_widget(self._log_status)
+        left.add_widget(log_box)
         left.add_widget(Widget())
         self._cols.add_widget(left)
 
@@ -3433,11 +3884,54 @@ class StartLineScreen(TabScreen):
             d,b=calc_dist_brg(self._pin[0],self._pin[1],self._rc[0],self._rc[1])
             if d: self._line_lbl.text=f'Lung: {d*1852:.0f}m   Brg: {b:.1f}'
 
+    def _toggle_log(self):
+        """Toggle del TrackLogger. Aggiorna etichetta/colore del pulsante e
+        la label di stato. Il timer di scrittura e' gestito dal TrackLogger
+        stesso (Clock dedicato a 5s), quindi continua a girare anche se
+        l'utente lascia questa schermata."""
+        tl = self.dm.track_logger
+        if tl.is_active():
+            tl.stop()
+        else:
+            ok, msg = tl.start()
+            if not ok:
+                # Errore in avvio: mostra il motivo nella label
+                self._log_status.text = f'Errore: {msg}'
+                self._log_status.color = RED
+                return
+        self._refresh_log_ui()
+
+    def _refresh_log_ui(self):
+        """Sincronizza pulsante e label con lo stato attuale del logger."""
+        tl = self.dm.track_logger
+        if tl.is_active():
+            self._log_btn.text = 'Ferma log'
+            self._log_btn.background_color = RED
+            self._log_btn.color = (0, 0, 0, 1)
+            # Mostro solo il filename (non l'intero path) per leggibilita'
+            fn = os.path.basename(tl.get_path() or '')
+            self._log_status.text = f'{fn}\n{tl.get_count()} righe (ogni 5s)'
+            self._log_status.color = GREEN
+        else:
+            self._log_btn.text = 'Avvia log'
+            self._log_btn.background_color = BTN_GRAY
+            self._log_btn.color = WHITE
+            cnt = tl.get_count()
+            if cnt > 0:
+                self._log_status.text = f'Log fermato ({cnt} righe)'
+                self._log_status.color = MUTED
+            else:
+                self._log_status.text = 'Log non attivo'
+                self._log_status.color = MUTED
+
     def tick(self,dt):
         super().tick(dt); dm=self.dm
         if self._pin and dm.gps_lat:
             d,_=calc_dist_brg(dm.gps_lat,dm.gps_lon,self._pin[0],self._pin[1])
             if d is not None: self._dist_lbl.text=f'Distanza: {d*1852:.0f}  m'
+        # Aggiorno UI del logger ad ogni tick: il contatore righe va su
+        # in autonomia (timer separato) ma serve riflesso visivo qui.
+        self._refresh_log_ui()
 
 # =============================================================================
 # 3 -- LAYLINE
@@ -3849,7 +4343,8 @@ class WaypointsScreen(TabScreen):
                         ('Imposta boa',  self._set_mark),
                         ('Rimuovi',      self._del),
                         ('Carica da file', self._reload_from_file),
-                        ('Scarica da web', self._download_from_web)]:
+                        ('Scarica da web', self._download_from_web),
+                        ('Carica al cloud', self._upload_to_cloud)]:
             right.add_widget(mk_btn(txt,fn,sp(18)))
         right.add_widget(Label(text='BOA ATTIVA',font_size=sp(16),color=ACCENT,
                                 bold=True,size_hint_y=None,height=dp(32)))
@@ -4199,15 +4694,16 @@ class WaypointsScreen(TabScreen):
               size_hint=(0.5, 0.28)).open()
 
     def _download_from_web(self):
-        """Scarica waypoints.json dal cloud blob storage e lo salva localmente.
+        """Scarica waypoints.json dal cloud e lo salva localmente.
 
-        URL: {blob_base}/waypoints/{cloud_boat_id}/waypoints.json
-        I parametri sono in sailing_config.json.
+        URL: {api_base}/{cloud_boat_id}/waypoints.json
+        Entrambi i parametri sono in sailing_config.json.
 
-        Pattern UI bulletproof (idem _download_from_cloud):
-        - Un solo Popup, un solo Label, un solo Button creati a inizio.
-        - Worker aggiorna SOLO il testo della label (mai widget nuovi).
-        - try/except globale: errori inattesi visibili nel popup, no crash."""
+        Il download e' fatto in un thread separato per non bloccare la UI
+        (la rete su 4G/5G puo' avere latenze di parecchi secondi). Mentre
+        e' in corso, mostriamo un popup con messaggio "Scaricamento...";
+        a fine download il popup viene aggiornato con esito (successo o
+        errore) e l'utente lo chiude."""
         url = self.dm.download_waypoints_url()
         if not url:
             Popup(title='Scarica da web',
@@ -4217,61 +4713,108 @@ class WaypointsScreen(TabScreen):
                   size_hint=(0.6, 0.30)).open()
             return
 
-        # Popup costruito UNA volta, mai modificato strutturalmente
-        box = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
+        # Popup con label che aggiorneremo a fine download.
         status_lbl = Label(text=f'Scaricamento da:\n{url}\n\nAttendere...',
-                            halign='center', valign='middle', color=WHITE)
-        status_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        box.add_widget(status_lbl)
-        close_btn = Button(text='Attendere...',
-                            size_hint_y=None, height=dp(48),
-                            background_color=BTN_GRAY, background_normal='',
-                            color=WHITE, bold=True, disabled=True)
-        box.add_widget(close_btn)
-
-        pop = Popup(title='Scarica da web', content=box,
-                     size_hint=(0.80, 0.55), auto_dismiss=False)
-        close_btn.bind(on_release=lambda _: pop.dismiss())
+                           halign='center', valign='middle')
+        pop = Popup(title='Scarica da web', content=status_lbl,
+                    size_hint=(0.7, 0.40), auto_dismiss=False)
+        # Bottone Chiudi disabilitato finche' il download non finisce
+        # (auto_dismiss=False blocca anche il tap fuori dal popup).
         pop.open()
 
-        def _finish(text, color, refresh_ui=False):
-            try:
-                if refresh_ui:
-                    # Aggiorno UI: nuova lista + reset selezione + check target
-                    if self.dm.target_mark and not any(
-                            w.get('name') == self.dm.target_mark
-                            for w in self.dm.waypoints):
-                        self.dm.target_mark = None
-                        self.dm._reset_mark_pass_state()
-                        self.dm.save_cfg_safe()
-                    self._sel = None
-                    self._refresh()
-                status_lbl.text  = text
-                status_lbl.color = color
-                close_btn.text   = 'Chiudi'
-                close_btn.disabled = False
-                pop.auto_dismiss = True
-            except Exception as e:
-                print(f'_download_from_web waypoints _finish: {e}')
-
         def _worker():
-            try:
-                ok, msg = self.dm.download_waypoints_from_web()
-                if ok:
-                    Clock.schedule_once(lambda dt: _finish(
-                        f'OK: {msg}\n\nFile salvato in:\n{WAYPOINTS_PATH}',
-                        GREEN, refresh_ui=True), 0)
-                else:
-                    Clock.schedule_once(lambda dt, m=msg: _finish(
-                        f'Errore download:\n{m}', RED), 0)
-            except Exception as e:
-                import traceback
-                print(f'_download_from_web waypoints CRASH:\n{traceback.format_exc()}')
-                Clock.schedule_once(
-                    lambda dt, m=f'{type(e).__name__}: {e}': _finish(
-                        f'Errore inatteso:\n{m}', RED), 0)
+            ok, msg = self.dm.download_waypoints_from_web()
+            # Torno sul main thread per toccare la UI (Kivy non e' thread-safe)
+            Clock.schedule_once(lambda dt: _on_done(ok, msg), 0)
+
+        def _on_done(ok, msg):
+            if ok:
+                # Aggiorno UI: nuova lista + reset selezione + check target
+                if self.dm.target_mark and not any(
+                        w.get('name') == self.dm.target_mark
+                        for w in self.dm.waypoints):
+                    self.dm.target_mark = None
+                    self.dm._reset_mark_pass_state()
+                    self.dm.save_cfg_safe()
+                self._sel = None
+                self._refresh()
+                status_lbl.text = (f'OK: {msg}\n\n'
+                                   f'File salvato in:\n{WAYPOINTS_PATH}')
+                status_lbl.color = GREEN
+            else:
+                status_lbl.text = f'Errore download:\n{msg}'
+                status_lbl.color = RED
+            # Riabilita la chiusura: ora l'utente puo' chiudere tappando fuori
+            pop.auto_dismiss = True
+            # Aggiungi un bottone Chiudi sotto il messaggio
+            box = BoxLayout(orientation='vertical', spacing=dp(8))
+            box.add_widget(status_lbl)
+            close_btn = Button(text='Chiudi', size_hint_y=None, height=dp(48),
+                               background_color=BTN_GRAY, background_normal='',
+                               color=WHITE, bold=True)
+            close_btn.bind(on_release=lambda _: pop.dismiss())
+            box.add_widget(close_btn)
+            pop.content = box
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _upload_to_cloud(self):
+        """Carica waypoints.json LOCALE sul blob storage cloud.
+
+        URL destinazione: {blob_base}/waypoints/{cloud_boat_id}/waypoints.json
+        Richiede waypoints_sas_token configurato in sailing_config.json
+        (permessi Write+Create sul container 'waypoints')."""
+        if not (self.dm.waypoints_sas_token or '').strip():
+            Popup(title='Carica al cloud',
+                  content=Label(text='waypoints_sas_token non configurato.\n'
+                                     'Genera un SAS (Write+Create) sul container\n'
+                                     '"waypoints" e settalo in sailing_config.json.',
+                                halign='center', valign='middle'),
+                  size_hint=(0.7, 0.34)).open()
+            return
+
+        status_lbl = Label(text='Caricamento in corso...',
+                           halign='center', valign='middle')
+        pop = Popup(title='Carica al cloud', content=status_lbl,
+                    size_hint=(0.7, 0.40), auto_dismiss=False)
+        pop.open()
+
+        def _worker():
+            ok, msg = self.dm.upload_waypoints_to_cloud()
+            Clock.schedule_once(lambda dt: _on_done(ok, msg), 0)
+
+        def _on_done(ok, msg):
+            if ok:
+                url = self.dm.download_waypoints_url() or '(URL non disponibile)'
+                status_lbl.text = (f'OK: {msg}\n\nDestinazione:\n{url}')
+                status_lbl.color = GREEN
+            else:
+                status_lbl.text = f'Errore upload:\n{msg}'
+                status_lbl.color = RED
+            pop.auto_dismiss = True
+            box = BoxLayout(orientation='vertical', spacing=dp(8))
+            box.add_widget(status_lbl)
+            close_btn = Button(text='Chiudi', size_hint_y=None, height=dp(48),
+                               background_color=BTN_GRAY, background_normal='',
+                               color=WHITE, bold=True)
+            close_btn.bind(on_release=lambda _: pop.dismiss())
+            box.add_widget(close_btn)
+            pop.content = box
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        # _refresh completo: cosi' nella lista si aggiornano i marker
+        # ('*' boa attiva, '>' prossima) e la mappa evidenzia la nuova boa.
+        cur_target = dm.target_mark
+        prev_target = getattr(self, '_last_seen_target', None)
+        if cur_target != prev_target:
+            self._last_seen_target = cur_target
+            self._refresh()
+        else:
+            # Solo redraw mappa: la posizione barca cambia ad ogni tick ma
+            # la lista no, evitiamo di ricostruire i bottoni inutilmente
+            try: Clock.schedule_once(lambda dt: self._map.redraw(), 0)
+            except: pass
 
 # =============================================================================
 # 5 -- POLARI
@@ -4346,6 +4889,8 @@ class PolarScreen(TabScreen):
                                 self._reload_from_file, sp(18)))
         right.add_widget(mk_btn('Scarica da web',
                                 self._download_from_web, sp(18)))
+        right.add_widget(mk_btn('Carica al cloud',
+                                self._upload_to_cloud, sp(18)))
         # Mostra il path da cui si carica (read-only, modificabile solo da
         # config.json). Cosi' l'utente sa esattamente quale file editare.
         self._path_lbl=Label(text=self._fmt_path(),font_size=sp(13),color=MUTED,
@@ -4364,27 +4909,6 @@ class PolarScreen(TabScreen):
         self._vd=Label(text='Poppa: --', font_size=sp(18),color=ACCENT,
                         size_hint_y=None,height=dp(38))
         right.add_widget(self._vu); right.add_widget(self._vd)
-
-        # Sezione 4: VELA SUGGERITA (live, da tabella crossover se presente).
-        # La label mostra: nome vela + label umana + colore di sfondo.
-        # Il pulsante apre il popup con la tabella crossover completa.
-        right.add_widget(Label(text='VELA SUGGERITA',font_size=sp(16),color=ACCENT,
-                                bold=True,size_hint_y=None,height=dp(32)))
-        self._sail_lbl = Label(text='--',font_size=sp(20),color=WHITE,bold=True,
-                                size_hint_y=None,height=dp(54),
-                                halign='center',valign='middle')
-        self._sail_lbl.bind(size=self._sail_lbl.setter('text_size'))
-        # Sfondo dinamico (Rectangle gestito in _upd_sail). Inizializzo grigio.
-        with self._sail_lbl.canvas.before:
-            self._sail_bg_color = Color(*MUTED)
-            self._sail_bg_rect  = Rectangle(pos=self._sail_lbl.pos,
-                                             size=self._sail_lbl.size)
-        self._sail_lbl.bind(pos=lambda w,p: setattr(self._sail_bg_rect,'pos',p),
-                             size=lambda w,s: setattr(self._sail_bg_rect,'size',s))
-        right.add_widget(self._sail_lbl)
-        right.add_widget(mk_btn('Tabella vele',
-                                 self._show_sail_crossover, sp(16)))
-
         right.add_widget(Widget())
         self._cols.add_widget(right)
         self._refresh_table()
@@ -4456,10 +4980,12 @@ class PolarScreen(TabScreen):
             self._msg('Errore', f'File non valido:\n{path}')
 
     def _download_from_web(self):
-        """Scarica polar.json dal cloud blob storage e lo salva in self.dm.polar_path.
+        """Scarica polar.json dal cloud e lo salva in self.dm.polar_path.
 
-        URL: {blob_base}/polars/{cloud_boat_id}/polar.json
-        Pattern UI bulletproof: stesso schema delle altre operazioni cloud."""
+        URL: {api_base}/{cloud_boat_id}/polar.json
+        Stessa logica della WaypointsScreen._download_from_web: thread
+        separato per non bloccare la UI, popup non chiudibile mentre
+        scarica, esito a video con bottone Chiudi."""
         url = self.dm.download_polar_url()
         if not url:
             Popup(title='Scarica da web',
@@ -4469,52 +4995,80 @@ class PolarScreen(TabScreen):
                   size_hint=(0.6, 0.30)).open()
             return
 
-        # Popup costruito UNA volta sola
-        box = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
         status_lbl = Label(text=f'Scaricamento da:\n{url}\n\nAttendere...',
-                            halign='center', valign='middle', color=WHITE)
-        status_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        box.add_widget(status_lbl)
-        close_btn = Button(text='Attendere...',
-                            size_hint_y=None, height=dp(48),
-                            background_color=BTN_GRAY, background_normal='',
-                            color=WHITE, bold=True, disabled=True)
-        box.add_widget(close_btn)
-
-        pop = Popup(title='Scarica da web', content=box,
-                     size_hint=(0.80, 0.55), auto_dismiss=False)
-        close_btn.bind(on_release=lambda _: pop.dismiss())
+                           halign='center', valign='middle')
+        pop = Popup(title='Scarica da web', content=status_lbl,
+                    size_hint=(0.7, 0.40), auto_dismiss=False)
         pop.open()
 
-        def _finish(text, color, refresh_ui=False):
-            try:
-                if refresh_ui:
-                    self._refresh_table()
-                    self._refresh_enabled_btns()
-                status_lbl.text  = text
-                status_lbl.color = color
-                close_btn.text   = 'Chiudi'
-                close_btn.disabled = False
-                pop.auto_dismiss = True
-            except Exception as e:
-                print(f'_download_from_web polar _finish: {e}')
+        def _worker():
+            ok, msg = self.dm.download_polar_from_web()
+            Clock.schedule_once(lambda dt: _on_done(ok, msg), 0)
+
+        def _on_done(ok, msg):
+            if ok:
+                self._refresh_table()
+                self._refresh_enabled_btns()
+                status_lbl.text = (f'OK: {msg}\n\n'
+                                   f'File salvato in:\n{self.dm.polar_path}')
+                status_lbl.color = GREEN
+            else:
+                status_lbl.text = f'Errore download:\n{msg}'
+                status_lbl.color = RED
+            pop.auto_dismiss = True
+            box = BoxLayout(orientation='vertical', spacing=dp(8))
+            box.add_widget(status_lbl)
+            close_btn = Button(text='Chiudi', size_hint_y=None, height=dp(48),
+                               background_color=BTN_GRAY, background_normal='',
+                               color=WHITE, bold=True)
+            close_btn.bind(on_release=lambda _: pop.dismiss())
+            box.add_widget(close_btn)
+            pop.content = box
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _upload_to_cloud(self):
+        """Carica polar.json LOCALE sul blob storage cloud.
+
+        URL destinazione: {blob_base}/polars/{cloud_boat_id}/polar.json
+        Richiede polars_sas_token configurato in sailing_config.json
+        (permessi Write+Create sul container 'polars')."""
+        if not (self.dm.polars_sas_token or '').strip():
+            Popup(title='Carica al cloud',
+                  content=Label(text='polars_sas_token non configurato.\n'
+                                     'Genera un SAS (Write+Create) sul container\n'
+                                     '"polars" e settalo in sailing_config.json.',
+                                halign='center', valign='middle'),
+                  size_hint=(0.7, 0.34)).open()
+            return
+
+        status_lbl = Label(text='Caricamento in corso...',
+                           halign='center', valign='middle')
+        pop = Popup(title='Carica al cloud', content=status_lbl,
+                    size_hint=(0.7, 0.40), auto_dismiss=False)
+        pop.open()
 
         def _worker():
-            try:
-                ok, msg = self.dm.download_polar_from_web()
-                if ok:
-                    Clock.schedule_once(lambda dt: _finish(
-                        f'OK: {msg}\n\nFile salvato in:\n{self.dm.polar_path}',
-                        GREEN, refresh_ui=True), 0)
-                else:
-                    Clock.schedule_once(lambda dt, m=msg: _finish(
-                        f'Errore download:\n{m}', RED), 0)
-            except Exception as e:
-                import traceback
-                print(f'_download_from_web polar CRASH:\n{traceback.format_exc()}')
-                Clock.schedule_once(
-                    lambda dt, m=f'{type(e).__name__}: {e}': _finish(
-                        f'Errore inatteso:\n{m}', RED), 0)
+            ok, msg = self.dm.upload_polar_to_cloud()
+            Clock.schedule_once(lambda dt: _on_done(ok, msg), 0)
+
+        def _on_done(ok, msg):
+            if ok:
+                url = self.dm.download_polar_url() or '(URL non disponibile)'
+                status_lbl.text = (f'OK: {msg}\n\nDestinazione:\n{url}')
+                status_lbl.color = GREEN
+            else:
+                status_lbl.text = f'Errore upload:\n{msg}'
+                status_lbl.color = RED
+            pop.auto_dismiss = True
+            box = BoxLayout(orientation='vertical', spacing=dp(8))
+            box.add_widget(status_lbl)
+            close_btn = Button(text='Chiudi', size_hint_y=None, height=dp(48),
+                               background_color=BTN_GRAY, background_normal='',
+                               color=WHITE, bold=True)
+            close_btn.bind(on_release=lambda _: pop.dismiss())
+            box.add_widget(close_btn)
+            pop.content = box
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -4532,14 +5086,12 @@ class PolarScreen(TabScreen):
                                         color=MUTED,size_hint_y=None,height=dp(80)))
             return
         tws_l=p.get_tws_list(); twa_l=p.get_twa_list()
-        # Indicatore crossover vele: [+sails] se la polare ha la sezione vele
-        sails_tag = ' [+sails]' if p.has_sails() else ''
         # Stato in alto: distingue caricata+attiva vs caricata+disattivata
         if self.dm.polar_enabled:
-            self._st.text=f'OK  {p.boat_name or "--"}  {len(tws_l)}x{len(twa_l)}{sails_tag}  [ATTIVA]'
+            self._st.text=f'OK  {p.boat_name or "--"}  {len(tws_l)}x{len(twa_l)}  [ATTIVA]'
             self._st.color=GREEN
         else:
-            self._st.text=f'OK  {p.boat_name or "--"}  {len(tws_l)}x{len(twa_l)}{sails_tag}  [DISATTIVATA]'
+            self._st.text=f'OK  {p.boat_name or "--"}  {len(tws_l)}x{len(twa_l)}  [DISATTIVATA]'
             self._st.color=ORANGE
         self._tbl.cols=len(tws_l)+1
         ch=dp(40); cw=dp(80)
@@ -4563,983 +5115,386 @@ class PolarScreen(TabScreen):
         self._vu.text=f'Bolina: {up[0]:.0f}  VMG {up[1]:.2f}kn' if up else 'Bolina: --'
         self._vd.text=f'Poppa:  {dn[0]:.0f}  VMG {dn[1]:.2f}kn' if dn else 'Poppa: --'
 
-    def _upd_sail(self):
-        """Aggiorna in real-time la label "vela suggerita" leggendo TWS/TWA
-        correnti dal DataManager e consultando la tabella crossover.
-        Niente crossover (polar v1) -> mostra '(no crossover)' in grigio."""
-        p   = self.dm.polar
-        tws = self.dm.true_wind_speed
-        twa = self.dm.true_wind_angle
-        if not p.has_sails():
-            self._sail_lbl.text  = '(no crossover)'
-            self._sail_lbl.color = MUTED
-            self._sail_bg_color.rgba = (0.18, 0.18, 0.18, 1)
-            return
-        if tws is None or twa is None:
-            self._sail_lbl.text  = '(no wind data)'
-            self._sail_lbl.color = MUTED
-            self._sail_bg_color.rgba = (0.18, 0.18, 0.18, 1)
-            return
-        sail_id = p.get_sail(tws, twa)
-        if not sail_id:
-            self._sail_lbl.text  = '(N/D)'
-            self._sail_lbl.color = MUTED
-            self._sail_bg_color.rgba = (0.18, 0.18, 0.18, 1)
-            return
-        label    = p.get_sail_label(sail_id)
-        col_hex  = p.get_sail_color(sail_id)
-        rgba     = self._hex_to_rgba(col_hex, alpha=1.0)
-        self._sail_lbl.text  = f'{sail_id}\n{label}'
-        # Calcola colore testo: nero su sfondi chiari, bianco su scuri.
-        # Heuristic: luminanza > 0.5 -> testo nero.
-        r, g, b, _ = rgba
-        lum = 0.299*r + 0.587*g + 0.114*b
-        self._sail_lbl.color = (0, 0, 0, 1) if lum > 0.55 else (1, 1, 1, 1)
-        self._sail_bg_color.rgba = rgba
-
-    @staticmethod
-    def _hex_to_rgba(hex_str, alpha=1.0):
-        """Converte '#rrggbb' (con o senza '#') in tupla (r,g,b,a) [0..1].
-        Su input invalido restituisce un grigio neutro."""
-        try:
-            s = (hex_str or '').lstrip('#')
-            if len(s) == 3:
-                s = ''.join(c*2 for c in s)
-            r = int(s[0:2], 16) / 255.0
-            g = int(s[2:4], 16) / 255.0
-            b = int(s[4:6], 16) / 255.0
-            return (r, g, b, alpha)
-        except Exception:
-            return (0.5, 0.5, 0.5, alpha)
-
-    def _show_sail_crossover(self, *_):
-        """Popup con la tabella crossover: righe = TWS, colonne = bin TWA.
-        Ogni cella ha sfondo del colore della vela definito in 'sails.definitions'.
-        Se la polare non ha la sezione vele, mostra un messaggio informativo."""
-        p = self.dm.polar
-        if not p.has_sails():
-            Popup(title='Tabella vele',
-                  content=Label(text='Questa polare non ha la sezione "sails".\n'
-                                     'Aggiorna polar.json al formato v2 con:\n'
-                                     '  "sails": {"definitions": {...},\n'
-                                     '            "crossover": {...}}',
-                                halign='center', valign='middle'),
-                  size_hint=(0.7, 0.40)).open()
-            return
-
-        bins = p.SAIL_BINS
-        tws_keys = p._crossover_tws_keys()
-
-        # Layout: ScrollView -> GridLayout(cols=len(bins)+1) per scroll su tablet.
-        outer = BoxLayout(orientation='vertical', spacing=dp(6))
-        # Legenda compatta in alto: una riga per definizione vela
-        legend = BoxLayout(orientation='vertical',
-                            size_hint_y=None,
-                            height=dp(28) * max(1, len(p.sail_definitions)))
-        for sid, info in p.sail_definitions.items():
-            row = BoxLayout(orientation='horizontal',
-                             size_hint_y=None, height=dp(26),
-                             spacing=dp(6))
-            sw = Label(text='', size_hint_x=None, width=dp(40))
-            with sw.canvas.before:
-                Color(*self._hex_to_rgba(info.get('color', '#888888')))
-                rect = Rectangle(pos=sw.pos, size=sw.size)
-            sw.bind(pos=lambda w,pp,r=rect: setattr(r,'pos',pp),
-                     size=lambda w,ss,r=rect: setattr(r,'size',ss))
-            row.add_widget(sw)
-            row.add_widget(Label(text=f'{sid}  --  {info.get("label","")}',
-                                  font_size=sp(13),
-                                  halign='left', valign='middle',
-                                  color=WHITE))
-            legend.add_widget(row)
-        outer.add_widget(legend)
-
-        # Tabella crossover
-        sv = ScrollView(do_scroll_x=True, do_scroll_y=True)
-        cw = dp(70); ch = dp(40)
-        grid = GridLayout(cols=len(bins) + 1, spacing=dp(1),
-                           size_hint=(None, None))
-        grid.bind(minimum_height=grid.setter('height'),
-                   minimum_width=grid.setter('width'))
-
-        def hdr(text):
-            l = Label(text=text, font_size=sp(13), color=ACCENT, bold=True,
-                       size_hint=(None, None), width=cw, height=ch,
-                       halign='center', valign='middle')
-            l.text_size = (cw, ch)
-            return l
-
-        def cell(text, bg_rgba):
-            box = BoxLayout(size_hint=(None, None), width=cw, height=ch)
-            with box.canvas.before:
-                Color(*bg_rgba)
-                rect = Rectangle(pos=box.pos, size=box.size)
-            box.bind(pos=lambda w,pp,r=rect: setattr(r,'pos',pp),
-                      size=lambda w,ss,r=rect: setattr(r,'size',ss))
-            # Testo nero o bianco a seconda della luminanza
-            r, g, b, _ = bg_rgba
-            lum = 0.299*r + 0.587*g + 0.114*b
-            txt_col = (0,0,0,1) if lum > 0.55 else (1,1,1,1)
-            l = Label(text=text, font_size=sp(13), color=txt_col, bold=True,
-                       halign='center', valign='middle')
-            l.bind(size=l.setter('text_size'))
-            box.add_widget(l)
-            return box
-
-        # Header riga 0
-        grid.add_widget(hdr('TWS / TWA'))
-        for b in bins:
-            grid.add_widget(hdr(b))
-        # Righe
-        for tws_k in tws_keys:
-            grid.add_widget(hdr(f'{tws_k:.0f} kn'))
-            row_map = p.sail_crossover.get(tws_k, {})
-            for b in bins:
-                sail_id = row_map.get(b, '')
-                if sail_id:
-                    rgba = self._hex_to_rgba(p.get_sail_color(sail_id))
-                    grid.add_widget(cell(sail_id, rgba))
-                else:
-                    grid.add_widget(cell('--', (0.12, 0.12, 0.12, 1)))
-        sv.add_widget(grid)
-        outer.add_widget(sv)
-
-        # Bottone chiudi
-        close = Button(text='Chiudi', size_hint_y=None, height=dp(46),
-                       background_color=BTN_GRAY, background_normal='',
-                       color=WHITE, bold=True)
-        outer.add_widget(close)
-
-        title_txt = f'Tabella vele -- {p.boat_name or "polare"}'
-        pop = Popup(title=title_txt, content=outer,
-                     size_hint=(0.95, 0.92), auto_dismiss=True)
-        close.bind(on_release=lambda _: pop.dismiss())
-        pop.open()
-
     def tick(self,dt):
         super().tick(dt)
-        if self.dm.polar.loaded:
-            self._upd_vmg()
-            self._upd_sail()
+        if self.dm.polar.loaded: self._upd_vmg()
 
 # =============================================================================
-# 6 -- LOG REGATA (registrazione locale + upload one-shot + cloud live)
+# 6 -- LOGGING
 # =============================================================================
-# Tre funzioni in un'unica schermata:
-# 1. REGISTRAZIONE LOCALE: pulsante Start/Stop. Crea un CSV in log_dir
-#    chiamato track_YYYY-MM-DD_HH-MM-SS.csv e ci scrive una riga ogni 5s
-#    (gestito da TrackLogger del DataManager). Header e formato sono in
-#    TrackLogger.HEADER. La data nel nome file e' quella di START.
-# 2. INVIO ONE-SHOT AL BLOB: a registrazione fermata, pulsante "Invia al
-#    cloud" carica l'intero CSV su:
-#      {blob_base}/tracks/{cloud_boat_id}/{filename.csv}
-#    via Shared Key auth (vedi DataManager.upload_csv_to_blob).
-# 3. CLOUD UPLOAD LIVE: toggle ON/OFF + selettore intervallo (30s, 1m, 2m,
-#    5m, 10m). Quando ON, il CloudUploader del DataManager invia uno
-#    snapshot HTTPS ogni N secondi al backend (cloud_url), che a sua volta
-#    fa l'INSERT su SQL Server tabella 'traks' di sailing-sql-7645.
-#    Indipendente dal logger locale: si puo' avere live ON anche senza
-#    registrazione e viceversa.
 
 class LoggingScreen(TabScreen):
-    """Schermata "Log": gestione completa logging regata."""
-
-    # Frequenze upload selezionabili (secondi -> etichetta breve UI)
-    FREQ_CHOICES = [(30, '30s'), (60, '1m'), (120, '2m'),
-                     (300, '5m'), (600, '10m')]
-
-    def __init__(self, dm, **kw):
-        super().__init__(dm, 'Log  Registrazione', name='logging', **kw)
+    """Schermata "Log": mostra il grafico della velocita' e i dati real-time.
+    Il logging vero e proprio e' gestito dal TrackLogger del DataManager
+    (timer dedicato a 5s, indipendente dalla schermata corrente). Qui c'e'
+    solo il toggle e il feedback di stato -- duplica il pulsante della
+    schermata Start per comodita' dell'utente."""
+    def __init__(self,dm,**kw):
+        super().__init__(dm,'Log  Logging',name='logging',**kw)
+        self._hist=[]
         self._build()
 
     def _build(self):
-        outer = BoxLayout(orientation='horizontal', spacing=dp(8),
-                           size_hint=(1, 1))
-        self.body.add_widget(outer)
+        self._cols=BoxLayout(orientation='horizontal',spacing=dp(8),
+                              size_hint=(1,1))
+        self.body.add_widget(self._cols)
+        left=BoxLayout(orientation='vertical',spacing=dp(6),
+                        padding=dp(8),size_hint_x=0.54)
+        _bg(left,PANEL)
+        left.add_widget(Label(text='VELOCITA SOG -- ultimi 120s',font_size=sp(16),
+                               color=ACCENT,bold=True,size_hint_y=None,height=dp(32)))
+        self._chart=Widget(size_hint=(1,1))
+        self._chart.bind(pos=self._req_chart,size=self._req_chart)
+        left.add_widget(self._chart)
+        self._cols.add_widget(left)
+        right=BoxLayout(orientation='vertical',spacing=dp(8),
+                         padding=dp(10),size_hint_x=0.46)
+        _bg(right,PANEL)
+        # Pulsante toggle: stesso comportamento della schermata Start.
+        # Etichetta dinamica ("Avvia log" / "Ferma log") gestita in tick().
+        br=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(70))
+        self._log_btn=mk_btn('Avvia log',self._toggle_log,sp(20))
+        br.add_widget(self._log_btn)
+        right.add_widget(br)
+        self._st=Label(text='Log non attivo',font_size=sp(16),color=MUTED,
+                        size_hint_y=None,height=dp(60),halign='center',valign='middle')
+        self._st.bind(size=lambda l,_: setattr(l,'text_size',l.size))
+        right.add_widget(self._st)
 
-        # ---- COLONNA SINISTRA: registrazione locale + invio one-shot ----
-        left = BoxLayout(orientation='vertical', spacing=dp(8),
-                          padding=dp(12), size_hint_x=0.5)
-        _bg(left, PANEL)
-        left.add_widget(Label(text='REGISTRAZIONE LOCALE', font_size=sp(20),
-                                color=ACCENT, bold=True,
-                                size_hint_y=None, height=dp(40)))
-        # Stato a caratteri grandi
-        self._rec_status = Label(text='Non in registrazione',
-                                   font_size=sp(22), color=MUTED, bold=True,
-                                   size_hint_y=None, height=dp(60),
-                                   halign='center', valign='middle')
-        self._rec_status.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        left.add_widget(self._rec_status)
-        # Filename + conteggio righe
-        self._rec_info = Label(text='Premi START per registrare un nuovo log',
-                                 font_size=sp(15), color=MUTED,
-                                 size_hint_y=None, height=dp(80),
-                                 halign='center', valign='middle')
-        self._rec_info.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        left.add_widget(self._rec_info)
-        # Pulsante Start / Stop (cambia testo+colore in base allo stato)
-        self._toggle_btn = mk_btn('START', self._toggle_log, sp(28))
-        self._toggle_btn.size_hint_y = None
-        self._toggle_btn.height = dp(80)
-        left.add_widget(self._toggle_btn)
-        # Spazio
-        left.add_widget(Label(text='', size_hint_y=None, height=dp(8)))
-        # Pulsante Invia al cloud (one-shot, abilitato solo se log fermo
-        # e c'e' un last_path disponibile)
-        left.add_widget(Label(text='INVIO AL BLOB STORAGE', font_size=sp(18),
-                                color=ACCENT, bold=True,
-                                size_hint_y=None, height=dp(36)))
-        # Info: dove va caricato
-        info_url = (f'Destinazione:\n{self.dm.blob_base or BLOB_BASE_DEFAULT}'
-                    f'/{BLOB_CONTAINER_TRACKS}/{self.dm.cloud_boat_id}/<file>.csv')
-        self._upload_dest_lbl = Label(text=info_url,
-                                        font_size=sp(13), color=MUTED,
-                                        size_hint_y=None, height=dp(60),
-                                        halign='center', valign='middle')
-        self._upload_dest_lbl.bind(
-            size=lambda l, _: setattr(l, 'text_size', l.size))
-        left.add_widget(self._upload_dest_lbl)
-        self._upload_btn = mk_btn('Invia al cloud',
-                                    self._upload_last_csv, sp(20))
-        self._upload_btn.size_hint_y = None
-        self._upload_btn.height = dp(70)
-        self._upload_btn.disabled = True
-        left.add_widget(self._upload_btn)
-        # Status invio
-        self._upload_status = Label(text='', font_size=sp(14),
-                                      color=MUTED, halign='center',
-                                      valign='top',
-                                      size_hint_y=None, height=dp(60))
-        self._upload_status.bind(
-            size=lambda l, _: setattr(l, 'text_size', l.size))
-        left.add_widget(self._upload_status)
-        left.add_widget(Widget())
-        outer.add_widget(left)
+        # ----- UPLOAD CLOUD: pulsante "Invia al cloud" + status coda -----
+        # Permette upload manuale anche in caso di mancata connettivita'
+        # durante la chiusura del log. Lo status mostra n. file in coda
+        # e l'esito dell'ultimo tentativo.
+        right.add_widget(Label(text='UPLOAD CLOUD',font_size=sp(14),color=ACCENT,
+                                bold=True,size_hint_y=None,height=dp(24)))
+        bu=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
+        self._upload_btn=mk_btn('Invia al cloud',self._force_upload,sp(18))
+        self._download_btn=mk_btn('Scarica dal cloud',self._download_from_cloud,sp(18))
+        bu.add_widget(self._upload_btn)
+        bu.add_widget(self._download_btn)
+        right.add_widget(bu)
+        self._upload_status=Label(text='--',font_size=sp(14),color=MUTED,
+                                   size_hint_y=None,height=dp(60),halign='center',valign='middle')
+        self._upload_status.bind(size=lambda l,_: setattr(l,'text_size',l.size))
+        right.add_widget(self._upload_status)
 
-        # ---- COLONNA DESTRA: cloud upload live ----
-        right = BoxLayout(orientation='vertical', spacing=dp(8),
-                           padding=dp(12), size_hint_x=0.5)
-        _bg(right, PANEL)
-        right.add_widget(Label(text='CLOUD UPLOAD LIVE', font_size=sp(20),
-                                 color=ACCENT, bold=True,
-                                 size_hint_y=None, height=dp(40)))
-        right.add_widget(Label(
-            text='Invia uno snapshot HTTPS ogni N secondi al backend.\n'
-                 'Il backend scrive su SQL Server (tabella "traks").',
-            font_size=sp(13), color=MUTED,
-            size_hint_y=None, height=dp(60),
-            halign='center', valign='middle'))
+        # ----- LOG ERRORI: invio al cloud dei log di errore -----
+        # I log vengono raccolti automaticamente in {LOG_PATH}/errors/ con
+        # un file al giorno. Il pulsante "Invia log oggi" carica il file
+        # del giorno corrente nel container 'logs/{boat_id}/' del blob.
+        # "Invia tutti" carica anche i file dei giorni precedenti.
+        right.add_widget(Label(text='LOG ERRORI',font_size=sp(14),color=ACCENT,
+                                bold=True,size_hint_y=None,height=dp(24)))
+        be=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
+        self._errlog_today_btn = mk_btn('Invia log oggi',
+                                         self._upload_error_log_today, sp(16))
+        self._errlog_all_btn   = mk_btn('Invia tutti',
+                                         self._upload_error_log_all,   sp(16))
+        be.add_widget(self._errlog_today_btn)
+        be.add_widget(self._errlog_all_btn)
+        right.add_widget(be)
+        self._errlog_status = Label(text='--',font_size=sp(14),color=MUTED,
+                                     size_hint_y=None,height=dp(60),
+                                     halign='center',valign='middle')
+        self._errlog_status.bind(size=lambda l,_: setattr(l,'text_size',l.size))
+        right.add_widget(self._errlog_status)
 
-        # Toggle ON/OFF (due pulsanti)
-        en_row = BoxLayout(spacing=dp(6), size_hint_y=None, height=dp(60))
-        self._cloud_on = mk_btn('ON',
-                                  lambda: self._set_cloud_enabled(True),
-                                  sp(20))
-        self._cloud_off = mk_btn('OFF',
-                                   lambda: self._set_cloud_enabled(False),
-                                   sp(20))
-        en_row.add_widget(self._cloud_on)
-        en_row.add_widget(self._cloud_off)
-        right.add_widget(en_row)
-
-        # Selettore intervallo
-        right.add_widget(Label(text='Frequenza upload:',
-                                 font_size=sp(15), color=MUTED,
-                                 size_hint_y=None, height=dp(28),
-                                 halign='left', valign='middle'))
-        fr_row = BoxLayout(spacing=dp(4), size_hint_y=None, height=dp(56))
-        self._cloud_freq_btns = {}
-        for secs, label in self.FREQ_CHOICES:
-            b = mk_btn(label,
-                        lambda s=secs: self._set_cloud_interval(s),
-                        sp(16))
-            self._cloud_freq_btns[secs] = b
-            fr_row.add_widget(b)
-        right.add_widget(fr_row)
-
-        # Status cloud (multi-linea)
-        right.add_widget(Label(text='Stato:',
-                                 font_size=sp(15), color=MUTED,
-                                 size_hint_y=None, height=dp(28),
-                                 halign='left', valign='middle'))
-        self._cloud_status = Label(text='--', font_size=sp(15),
-                                     color=MUTED, halign='left', valign='top',
-                                     size_hint_y=None, height=dp(180))
-        self._cloud_status.bind(
-            size=lambda l, _: setattr(l, 'text_size', l.size))
-        _bg(self._cloud_status, BG)
-        right.add_widget(self._cloud_status)
-
-        # Pulsante "Invia ora" (forza un ciclo immediato)
-        self._cloud_send_btn = mk_btn_gray('Invia subito',
-                                             self._cloud_send_now, sp(16))
-        self._cloud_send_btn.size_hint_y = None
-        self._cloud_send_btn.height = dp(56)
-        right.add_widget(self._cloud_send_btn)
+        right.add_widget(Label(text='DATI REAL-TIME',font_size=sp(16),color=ACCENT,
+                                bold=True,size_hint_y=None,height=dp(32)))
+        self._rows={}
+        for k in ('SOG kn','COG','HDG','TWS kn','TWA','AWS kn','Depth m','VMG kn','Lat','Lon'):
+            self._rows[k]=kv_row(right,k+':')
         right.add_widget(Widget())
-        outer.add_widget(right)
+        self._cols.add_widget(right)
 
-        # Stato iniziale
-        self._refresh_cloud_buttons()
+    def _do_resize(self,dt):
+        try: Clock.schedule_once(lambda dt:self._draw_chart(),0)
+        except: pass
 
-    # ------------------------------------------------------------------
-    # Registrazione locale
-    # ------------------------------------------------------------------
-    def _toggle_log(self, *_):
+    def _req_chart(self,*_): Clock.schedule_once(lambda dt:self._draw_chart(),0)
+
+    def _toggle_log(self):
+        """Stesso toggle della StartLineScreen, opera sul TrackLogger condiviso."""
         tl = self.dm.track_logger
         if tl.is_active():
             tl.stop()
-            self._upload_status.text = ''
         else:
             ok, msg = tl.start()
             if not ok:
-                self._upload_status.text = f'Errore avvio: {msg}'
-                self._upload_status.color = RED
-        # Refresh subito (anche se tick lo fara' ad ogni ciclo)
+                self._st.text = f'Errore: {msg}'
+                self._st.color = RED
+                return
         self._refresh_log_ui()
 
     def _refresh_log_ui(self):
+        """Sincronizza pulsante + label di stato col TrackLogger."""
         tl = self.dm.track_logger
         if tl.is_active():
-            self._rec_status.text = 'IN REGISTRAZIONE'
-            self._rec_status.color = GREEN
+            self._log_btn.text = 'Ferma log'
+            self._log_btn.background_color = RED
+            self._log_btn.color = (0, 0, 0, 1)
             fn = os.path.basename(tl.get_path() or '')
-            started = tl.get_started_at()
-            elapsed = ''
-            if started:
-                delta = (datetime.now() - started).total_seconds()
-                m, s = int(delta // 60), int(delta % 60)
-                elapsed = f' ({m:02d}:{s:02d})'
-            self._rec_info.text = (f'File: {fn}{elapsed}\n'
-                                     f'Righe scritte: {tl.get_count()}')
-            self._rec_info.color = WHITE
-            self._toggle_btn.text = 'STOP'
-            self._toggle_btn.background_color = RED
-            self._toggle_btn.color = (0, 0, 0, 1)
-            # Disabilita upload mentre registriamo (file ancora aperto)
-            self._upload_btn.disabled = True
+            self._st.text = f'Attivo (5s): {fn}\n{tl.get_count()} righe'
+            self._st.color = GREEN
         else:
-            self._rec_status.text = 'Non in registrazione'
-            self._rec_status.color = MUTED
-            last = tl.get_last_path()
-            cnt = tl.get_count()
-            if last:
-                fn = os.path.basename(last)
-                self._rec_info.text = (f'Ultimo log: {fn}\n'
-                                         f'Righe: {cnt}')
-                self._rec_info.color = WHITE
-                self._upload_btn.disabled = False
+            self._log_btn.text = 'Avvia log'
+            self._log_btn.background_color = BTN_GRAY
+            self._log_btn.color = WHITE
+            err = tl.get_last_error()
+            if err:
+                self._st.text = f'Fermato. Ultimo errore: {err}'
+                self._st.color = ORANGE
+            elif tl.get_count() > 0:
+                self._st.text = f'Fermato -- {tl.get_count()} righe'
+                self._st.color = MUTED
             else:
-                self._rec_info.text = 'Premi START per registrare un nuovo log'
-                self._rec_info.color = MUTED
-                self._upload_btn.disabled = True
-            self._toggle_btn.text = 'START'
-            self._toggle_btn.background_color = BTN_GRAY
-            self._toggle_btn.color = WHITE
+                self._st.text = 'Log non attivo'
+                self._st.color = MUTED
+        # Aggiorna anche lo status di upload cloud
+        self._refresh_upload_ui()
+        # Aggiorna lo stato passivo del log errori (conteggio + ultimo errore).
+        # Lo facciamo SOLO se l'utente non ha appena cliccato un upload: in
+        # quel caso _errlog_status mostra "Invio log..." o l'esito, e non
+        # dobbiamo sovrascriverlo. Riconosciamo il caso "passivo" guardando
+        # se il testo corrente e' uno dei "transient" che impostiamo noi.
+        try:
+            current = self._errlog_status.text
+            transient_prefixes = ('Invio log', 'Invio tutti')
+            if not any(current.startswith(p) for p in transient_prefixes):
+                cnt = _error_logger.count
+                last_msg = _error_logger.last_error_msg
+                last_ts = _error_logger.last_error_ts
+                if cnt == 0:
+                    self._errlog_status.text = 'Nessun errore registrato'
+                    self._errlog_status.color = GREEN
+                else:
+                    age = ''
+                    if last_ts:
+                        sec = max(0, int(time.time() - last_ts))
+                        if sec < 60: age = f' ({sec}s fa)'
+                        elif sec < 3600: age = f' ({sec//60}m fa)'
+                        else: age = f' ({sec//3600}h fa)'
+                    short = (last_msg or '')[:50]
+                    self._errlog_status.text = (f'{cnt} errori catturati{age}\n'
+                                                 f'Ultimo: {short}')
+                    self._errlog_status.color = ORANGE
+        except Exception:
+            pass
 
-    # ------------------------------------------------------------------
-    # Upload one-shot del CSV al blob storage
-    # ------------------------------------------------------------------
-    def _upload_last_csv(self, *_):
-        tl = self.dm.track_logger
-        last = tl.get_last_path()
-        if not last:
-            self._upload_status.text = 'Nessun log da inviare'
-            self._upload_status.color = ORANGE
-            return
-        if not (self.dm.blob_account_key or '').strip():
-            self._upload_status.text = ('blob_account_key non configurata\n'
-                                         '(modifica sailing_config.json)')
+    def _force_upload(self):
+        """Pulsante 'Invia al cloud': forza upload dei file in coda.
+        L'upload e' asincrono in un thread, qui aggiorniamo solo la UI."""
+        tu = getattr(self.dm, 'track_uploader', None)
+        if not tu:
+            self._upload_status.text = 'Track uploader non disponibile'
             self._upload_status.color = RED
             return
-        # Disabilita pulsante e fai upload in thread separato
-        self._upload_btn.disabled = True
-        self._upload_status.text = 'Caricamento in corso...'
-        self._upload_status.color = WHITE
+        ok, msg = tu.force_upload()
+        # Mostra subito il messaggio (sara' aggiornato dal tick)
+        self._upload_status.text = msg or '--'
+        self._upload_status.color = GREEN if ok else ORANGE
 
-        def _worker(path=last):
-            try:
-                ok, msg = self.dm.upload_csv_to_blob(path)
-                Clock.schedule_once(
-                    lambda dt, o=ok, m=msg: self._on_upload_done(o, m), 0)
-            except Exception as e:
-                import traceback
-                print(f'_upload_last_csv CRASH:\n{traceback.format_exc()}')
-                Clock.schedule_once(
-                    lambda dt, m=f'{type(e).__name__}: {e}':
-                        self._on_upload_done(False, m), 0)
+    def _download_from_cloud(self):
+        """Pulsante 'Scarica dal cloud': lista i CSV nel container 'tracks/{boat}/'
+        e li scarica tutti localmente in LOG_PATH (sovrascrive se gia' presenti).
 
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_upload_done(self, ok, msg):
-        if ok:
-            self._upload_status.text = msg or 'OK'
-            self._upload_status.color = GREEN
-        else:
-            self._upload_status.text = f'Errore: {msg}'
-            self._upload_status.color = RED
-        # Riabilita pulsante (anche su errore: l'utente puo' riprovare)
-        self._upload_btn.disabled = False
-
-    # ------------------------------------------------------------------
-    # Cloud upload live (snapshot ogni N secondi)
-    # ------------------------------------------------------------------
-    def _set_cloud_enabled(self, enabled):
-        self.dm.cloud_enabled = bool(enabled)
-        self.dm.save_cfg_safe()
-        if enabled:
-            self.dm.cloud.start()
-        else:
-            self.dm.cloud.stop()
-        self._refresh_cloud_buttons()
-
-    def _set_cloud_interval(self, secs):
-        if secs not in (30, 60, 120, 300, 600):
+        Richiede tracks_sas_token con permessi List+Read (oltre a Write+Create
+        gia' usati per l'upload). Lavora in thread separato per non bloccare
+        la UI; popup mostra progresso e esito."""
+        tu = getattr(self.dm, 'track_uploader', None)
+        if not tu:
+            self._msg_simple('Errore', 'Track uploader non disponibile')
             return
-        self.dm.cloud_interval_s = secs
-        self.dm.save_cfg_safe()
-        self._refresh_cloud_buttons()
-
-    def _cloud_send_now(self, *_):
-        ok, err = self.dm.cloud.trigger_now()
-        if ok:
-            self._cloud_status.text = (self._cloud_status.text +
-                                          '\n[Invio manuale lanciato]')
-        else:
-            self._cloud_status.text = (self._cloud_status.text +
-                                          f'\n[Attendi: {err}]')
-
-    def _refresh_cloud_buttons(self):
-        # ON/OFF
-        if self.dm.cloud_enabled:
-            self._cloud_on.background_color = GREEN
-            self._cloud_on.color = (0, 0, 0, 1)
-            self._cloud_off.background_color = BTN_GRAY
-            self._cloud_off.color = WHITE
-        else:
-            self._cloud_on.background_color = BTN_GRAY
-            self._cloud_on.color = WHITE
-            self._cloud_off.background_color = RED
-            self._cloud_off.color = (0, 0, 0, 1)
-        # Frequenza
-        cur = self.dm.cloud_interval_s
-        for s, btn in self._cloud_freq_btns.items():
-            if s == cur:
-                btn.background_color = ACCENT
-                btn.color = (0, 0, 0, 1)
-            else:
-                btn.background_color = BTN_GRAY
-                btn.color = WHITE
-
-    def _refresh_cloud_status(self):
-        cu = self.dm.cloud
-        running = cu.is_running()
-        last_str = '--'
-        if cu.last_sent_ts:
-            last_str = datetime.fromtimestamp(
-                cu.last_sent_ts).strftime('%H:%M:%S')
-        qsize = cu.queue_size()
-        state = ('ATTIVO' if (self.dm.cloud_enabled and running)
-                 else 'INATTIVO')
-        # Costruisco messaggio multi-linea
-        lines = [f'Stato: {state}',
-                 f'Inviati: {cu.sent_count}',
-                 f'Ultimo: {last_str}',
-                 f'In coda: {qsize}',
-                 f'URL: {self.dm.cloud_url[:50]}...'
-                    if len(self.dm.cloud_url) > 50 else
-                    f'URL: {self.dm.cloud_url}']
-        if cu.last_error:
-            err_msg = cu.last_error[:120]
-            lines.append(f'ERRORE: {err_msg}')
-        self._cloud_status.text = '\n'.join(lines)
-        # Colore status
-        if not self.dm.cloud_enabled:
-            self._cloud_status.color = MUTED
-        elif cu.last_error:
-            self._cloud_status.color = ORANGE
-        else:
-            self._cloud_status.color = GREEN
-
-    def tick(self, dt):
-        super().tick(dt)
-        self._refresh_log_ui()
-        self._refresh_cloud_status()
-
-
-# =============================================================================
-# 7 -- METEO PREVISIONALE PER REGATA
-# =============================================================================
-# Schermata che visualizza le previsioni meteo per la regata caricate da
-# Azure Blob Storage. Il file sorgente e':
-#   {blob_base}/meteo/{cloud_boat_id}/forecast.json
-#
-# Il file e' generato dal backend (script periodico che chiama Open-Meteo)
-# e contiene previsioni gia' pre-elaborate per i waypoint della barca.
-#
-# Formato JSON atteso (compatibile con il sito web in frontend/weather.js):
-# {
-#   "generated_at": "2026-05-08T14:00:00Z",      # ISO timestamp generazione
-#   "boat_id": "soar",
-#   "model": "AROME HD",                          # nome modello meteo usato
-#   "reference_time": "2026-05-09T10:00:00Z",     # data partenza regata (opt)
-#   "thresholds": {                               # soglie alert (opt)
-#       "wind": 22, "gust": 28, "wave": 2.0, "precip": 2.0
-#   },
-#   "waypoints": [
-#     {
-#       "name": "Pin",
-#       "lat": 45.66, "lon": 13.78,
-#       "horizons": {                             # 4 orizzonti rispetto a ref_time
-#           "0":  {"ts": "...", "wind_speed": 12.0, "wind_direction": 280,
-#                  "wind_gusts": 18.0, "wave_height": 0.5,
-#                  "precipitation": 0, "temperature": 18},
-#           "6":  {...},
-#           "12": {...},
-#           "24": {...}
-#       }
-#     },
-#     ...
-#   ]
-# }
-#
-# La schermata mostra:
-# 1. Card riassuntive lungo la rotta (+0/+6/+12/+24h): vento medio, raffica
-#    max, onda media, classe Beaufort colorata, badge ALERT se soglia superata.
-# 2. Tabella per waypoint con valori a +0h e +12h.
-# 3. Pulsante "Aggiorna" per ricaricare il file da blob storage.
-# =============================================================================
-
-class WeatherScreen(TabScreen):
-    """Schermata Meteo: previsioni precaricate da blob storage.
-
-    Layout:
-    - Header: nome modello + timestamp generazione + data partenza + pulsante Aggiorna
-    - Card +0h / +6h / +12h / +24h con vento/onda/pioggia medi sulla rotta
-    - Tabella waypoint con valori a +0h e +12h
-    """
-    # 4 orizzonti previsti nelle card (in ore dal reference_time)
-    HORIZONS = (0, 6, 12, 24)
-
-    # Soglie default per badge ALERT (sovrascritte da forecast['thresholds'])
-    DEFAULT_THR = {'wind': 22.0, 'gust': 28.0, 'wave': 2.0, 'precip': 2.0}
-
-    # Categorie Beaufort -> colore card (gradiente di sfondo)
-    # Identico al frontend (weather.js -> windClass) per coerenza grafica.
-    @staticmethod
-    def wind_class_color(kn):
-        """Tinta del background card in base al vento (kn).
-        Restituisce (r, g, b, a) RGBA float 0..1."""
-        if kn is None:
-            return (0.10, 0.13, 0.20, 1)        # grigio scuro neutro
-        if kn < 5:    return (0.13, 0.18, 0.26, 1)   # calm
-        if kn < 11:   return (0.13, 0.23, 0.18, 1)   # light
-        if kn < 17:   return (0.16, 0.25, 0.13, 1)   # mod
-        if kn < 22:   return (0.27, 0.24, 0.10, 1)   # fresh
-        if kn < 28:   return (0.32, 0.20, 0.09, 1)   # strong
-        if kn < 34:   return (0.35, 0.13, 0.10, 1)   # near gale
-        return (0.30, 0.06, 0.06, 1)                  # gale+
-
-    @staticmethod
-    def deg_to_cardinal(deg):
-        """Direzione in gradi (0=N) -> punto cardinale stringa breve."""
-        if deg is None:
-            return '--'
-        dirs = ('N','NNE','NE','ENE','E','ESE','SE','SSE',
-                'S','SSW','SW','WSW','W','WNW','NW','NNW')
-        idx = int(round(((deg % 360) + 360) % 360 / 22.5)) % 16
-        return dirs[idx]
-
-    def __init__(self, dm, **kw):
-        super().__init__(dm, 'Meteo  Previsioni', name='weather', **kw)
-        self._forecast = None     # dict caricato dal blob (None = non caricato)
-        self._last_err = None
-        self._loading = False
-        self._build()
-
-    def _build(self):
-        # Layout: colonna unica, scrollabile per tablet piu' piccoli.
-        from kivy.uix.scrollview import ScrollView
-        outer = BoxLayout(orientation='vertical', spacing=dp(8),
-                           padding=dp(8), size_hint=(1, 1))
-        self.body.add_widget(outer)
-
-        # ---- HEADER: pulsante refresh + label stato ----
-        hdr = BoxLayout(orientation='horizontal', spacing=dp(8),
-                         size_hint_y=None, height=dp(60))
-        self._refresh_btn = mk_btn('Aggiorna previsione',
-                                    self._do_refresh, sp(18))
-        hdr.add_widget(self._refresh_btn)
-        outer.add_widget(hdr)
-
-        self._status_lbl = Label(
-            text='(Premi "Aggiorna previsione" per scaricare il forecast.)',
-            font_size=sp(15), color=MUTED,
-            size_hint_y=None, height=dp(40),
-            halign='center', valign='middle')
-        self._status_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        outer.add_widget(self._status_lbl)
-
-        self._meta_lbl = Label(
-            text='', font_size=sp(13), color=MUTED,
-            size_hint_y=None, height=dp(36),
-            halign='center', valign='middle')
-        self._meta_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        outer.add_widget(self._meta_lbl)
-
-        # ---- BODY scrollabile ----
-        self._scroll = ScrollView(size_hint=(1, 1),
-                                    do_scroll_x=False, do_scroll_y=True)
-        self._body_box = BoxLayout(orientation='vertical', spacing=dp(10),
-                                     size_hint_y=None)
-        self._body_box.bind(minimum_height=self._body_box.setter('height'))
-        self._scroll.add_widget(self._body_box)
-        outer.add_widget(self._scroll)
-
-        # All'avvio: prova caricamento automatico se il file e' gia'
-        # disponibile nel cache locale (futuro). Per ora resta vuoto.
-
-    # -------------------------------------------------------------------
-    # Refresh handler: scarica il file forecast.json dal blob.
-    # -------------------------------------------------------------------
-    def _do_refresh(self, *_):
-        if self._loading:
+        if not (self.dm.tracks_sas_token or '').strip():
+            self._msg_simple('Scarica dal cloud',
+                             'tracks_sas_token non configurato.\n'
+                             'Serve SAS con permessi List+Read+Write.')
             return
-        url = self.dm.download_meteo_url()
-        if not url:
-            self._set_status('cloud_boat_id non configurato in sailing_config.json',
-                              RED)
-            return
-        if not (self.dm.blob_account_key or '').strip():
-            self._set_status('blob_account_key non configurata.', RED)
-            return
-        self._loading = True
-        self._refresh_btn.disabled = True
-        self._set_status(f'Scaricamento da:\n{url[:80]}...', WHITE)
+
+        status_lbl = Label(text='Lettura lista file remoti...',
+                           halign='center', valign='middle')
+        pop = Popup(title='Scarica dal cloud', content=status_lbl,
+                    size_hint=(0.7, 0.50), auto_dismiss=False)
+        pop.open()
 
         def _worker():
-            try:
-                ok, data = self.dm._http_get_json(url, timeout=20)
-                if ok:
-                    Clock.schedule_once(
-                        lambda dt, d=data: self._on_loaded(d), 0)
-                else:
-                    Clock.schedule_once(
-                        lambda dt, m=str(data): self._on_error(m), 0)
-            except Exception as e:
-                import traceback
-                print(f'WeatherScreen worker CRASH:\n{traceback.format_exc()}')
+            ok, payload = tu.list_remote_tracks()
+            if not ok:
                 Clock.schedule_once(
-                    lambda dt, m=f'{type(e).__name__}: {e}': self._on_error(m),
-                    0)
-            finally:
-                Clock.schedule_once(lambda dt: self._unlock_refresh(), 0)
+                    lambda dt: _on_done(False, 0, 0, str(payload)), 0)
+                return
+            files = payload or []
+            if not files:
+                Clock.schedule_once(
+                    lambda dt: _on_done(True, 0, 0,
+                                         'Nessun file remoto da scaricare'), 0)
+                return
+
+            log_dir = self.dm.log_dir or LOG_PATH
+            os.makedirs(log_dir, exist_ok=True)
+            ok_count = 0
+            err_count = 0
+            errors = []
+            for i, fn in enumerate(files):
+                # Aggiorna progress sul main thread
+                Clock.schedule_once(
+                    lambda dt, idx=i, tot=len(files), name=fn:
+                        setattr(status_lbl, 'text',
+                                f'Download {idx+1}/{tot}: {name}'), 0)
+                dest = os.path.join(log_dir, fn)
+                ok2, err = tu.download_remote_track(fn, dest)
+                if ok2:
+                    ok_count += 1
+                else:
+                    err_count += 1
+                    errors.append(f'{fn}: {err}')
+            summary = (f'{ok_count} scaricati, {err_count} errori')
+            if errors:
+                # Mostra max 3 errori per non riempire il popup
+                summary += '\n\nErrori:\n' + '\n'.join(errors[:3])
+                if len(errors) > 3:
+                    summary += f'\n... e altri {len(errors)-3}'
+            Clock.schedule_once(
+                lambda dt: _on_done(err_count == 0, ok_count, err_count,
+                                     summary), 0)
+
+        def _on_done(ok, ok_count, err_count, msg):
+            log_dir = self.dm.log_dir or LOG_PATH
+            status_lbl.text = f'{msg}\n\nDestinazione locale:\n{log_dir}'
+            status_lbl.color = GREEN if ok else (ORANGE if ok_count else RED)
+            pop.auto_dismiss = True
+            box = BoxLayout(orientation='vertical', spacing=dp(8))
+            box.add_widget(status_lbl)
+            close_btn = Button(text='Chiudi', size_hint_y=None, height=dp(48),
+                               background_color=BTN_GRAY, background_normal='',
+                               color=WHITE, bold=True)
+            close_btn.bind(on_release=lambda _: pop.dismiss())
+            box.add_widget(close_btn)
+            pop.content = box
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _unlock_refresh(self):
-        self._loading = False
-        self._refresh_btn.disabled = False
+    def _upload_error_log_today(self):
+        """Pulsante 'Invia log oggi': PUT del file di errore odierno
+        al container 'logs/{boat_id}/' del blob storage.
 
-    def _on_error(self, msg):
-        self._last_err = msg
-        self._set_status(f'Errore download:\n{msg}', RED)
-        # Tieni la UI vuota / mantenuta: non azzero le card precedenti
-        # cosi' si vede ancora la previsione vecchia se c'era.
+        Lavora in thread separato per non bloccare la UI (il file puo'
+        essere grande in caso di molti crash)."""
+        self._upload_error_log(only_today=True)
 
-    def _on_loaded(self, data):
-        """Validazione di base + render UI."""
-        if not isinstance(data, dict):
-            return self._on_error('JSON non e\' un oggetto')
-        wps = data.get('waypoints')
-        if not isinstance(wps, list) or not wps:
-            return self._on_error('forecast.json: campo "waypoints" mancante o vuoto')
-        # OK: salva e renderizza
-        self._forecast = data
-        self._last_err = None
-        self._render_meta()
-        self._render_cards()
-        self._render_table()
-        n_wp = len(wps)
-        self._set_status(f'Previsione caricata: {n_wp} waypoint, '
-                          f'{len(self.HORIZONS)} orizzonti.', GREEN)
+    def _upload_error_log_all(self):
+        """Pulsante 'Invia tutti': PUT di tutti i file di errore presenti
+        in {LOG_PATH}/errors/, non solo quello di oggi."""
+        self._upload_error_log(only_today=False)
 
-    def _set_status(self, text, color):
-        try:
-            self._status_lbl.text = text
-            self._status_lbl.color = color
-        except Exception:
-            pass
+    def _upload_error_log(self, only_today):
+        """Implementazione comune per i due bottoni di upload log.
+        Avvia un thread che chiama _error_logger.upload_to_blob() e aggiorna
+        la label di stato col risultato."""
+        self._errlog_status.text = ('Invio log oggi...' if only_today
+                                     else 'Invio tutti i log...')
+        self._errlog_status.color = MUTED
 
-    # -------------------------------------------------------------------
-    # Rendering
-    # -------------------------------------------------------------------
-    def _render_meta(self):
-        f = self._forecast or {}
-        gen = f.get('generated_at', '?')
-        model = f.get('model', '?')
-        ref = f.get('reference_time', '')
-        # Mostro orario generazione in formato leggibile (gg/mm hh:mm)
-        gen_disp = gen
-        try:
-            # Parsing ISO 8601 senza external libs
-            from datetime import datetime
-            dt = datetime.fromisoformat(gen.replace('Z', '+00:00'))
-            gen_disp = dt.strftime('%d/%m %H:%M')
-        except Exception:
-            pass
-        line = f'Modello: {model}    Generato: {gen_disp}'
-        if ref:
+        dm = self.dm
+        def _worker():
             try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(ref.replace('Z', '+00:00'))
-                line += f'    Partenza: {dt.strftime("%d/%m %H:%M")}'
-            except Exception:
-                line += f'    Partenza: {ref}'
-        self._meta_lbl.text = line
+                ok, msg = _error_logger.upload_to_blob(dm, only_today=only_today)
+            except Exception as e:
+                ok, msg = False, f'{type(e).__name__}: {e}'
+                log_err(f'upload_error_log: {e}', exc=e)
 
-    def _render_cards(self):
-        """Crea 4 card (+0/+6/+12/+24h) con valori medi lungo la rotta."""
-        # Sezione titolo
-        self._body_box.clear_widgets()
-        title = Label(text='Riepilogo lungo la rotta',
-                        font_size=sp(18), color=ACCENT, bold=True,
-                        size_hint_y=None, height=dp(34),
-                        halign='left', valign='middle')
-        title.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        self._body_box.add_widget(title)
+            @mainthread
+            def _update():
+                self._errlog_status.text = msg or '--'
+                self._errlog_status.color = GREEN if ok else ORANGE
+            _update()
+        threading.Thread(target=_worker, daemon=True).start()
 
-        # Card row: 4 card affiancate (responsive: il tablet e' largo)
-        cards = BoxLayout(orientation='horizontal', spacing=dp(8),
-                           size_hint_y=None, height=dp(170))
-        thr = (self._forecast.get('thresholds') or self.DEFAULT_THR)
-        for h in self.HORIZONS:
-            agg = self._aggregate_horizon(h)
-            cards.add_widget(self._make_card(h, agg, thr))
-        self._body_box.add_widget(cards)
+    def _msg_simple(self, title, text):
+        """Helper popup informativo semplice."""
+        Popup(title=title,
+              content=Label(text=text, halign='center', valign='middle'),
+              size_hint=(0.6, 0.30)).open()
 
-    def _aggregate_horizon(self, hours):
-        """Aggrega vento/onda/pioggia su tutti i waypoint per un orizzonte.
-        Usa media vettoriale per la direzione (sin/cos) per evitare wraparound."""
-        wps = self._forecast.get('waypoints') or []
-        speeds, gusts, waves, precs, dirs_sin, dirs_cos = [], [], [], [], [], []
-        n_dir = 0
-        for wp in wps:
-            hh = (wp.get('horizons') or {}).get(str(hours))
-            if not hh:
-                continue
-            ws = hh.get('wind_speed')
-            wg = hh.get('wind_gusts')
-            wd = hh.get('wind_direction')
-            wave = hh.get('wave_height')
-            pr = hh.get('precipitation')
-            if ws is not None: speeds.append(ws)
-            if wg is not None: gusts.append(wg)
-            if wave is not None: waves.append(wave)
-            if pr is not None: precs.append(pr)
-            if wd is not None:
-                rad = math.radians(wd)
-                dirs_sin.append(math.sin(rad))
-                dirs_cos.append(math.cos(rad))
-                n_dir += 1
-        out = {
-            'wind_speed':    (sum(speeds) / len(speeds)) if speeds else None,
-            'wind_gusts':    max(gusts) if gusts else None,   # max raffica, non media
-            'wave_height':   (sum(waves) / len(waves)) if waves else None,
-            'precipitation': (sum(precs) / len(precs)) if precs else None,
-            'wind_direction': None,
-        }
-        if n_dir:
-            ds = sum(dirs_sin) / n_dir
-            dc = sum(dirs_cos) / n_dir
-            out['wind_direction'] = (math.degrees(math.atan2(ds, dc)) + 360) % 360
-        return out
-
-    def _make_card(self, hours, agg, thr):
-        """Crea il widget visuale per UNA card orizzonte.
-        Layout verticale: titolo orizzonte / vento + freccia / raffica / onda+pioggia."""
-        # Sfondo colorato in base alla classe vento
-        from kivy.graphics import Color, RoundedRectangle
-        ws = agg.get('wind_speed')
-        bg = self.wind_class_color(ws)
-        # Alert: una qualsiasi soglia superata?
-        alert = self._check_alert(agg, thr)
-
-        card = BoxLayout(orientation='vertical', spacing=dp(2),
-                          padding=dp(8), size_hint_y=None, height=dp(170))
-        with card.canvas.before:
-            Color(*bg)
-            card._bg_rect = RoundedRectangle(pos=card.pos, size=card.size,
-                                              radius=[dp(6)])
-            # Bordo: rosso se alert, sottile altrimenti
-            if alert:
-                Color(0.85, 0.20, 0.15, 1)
-            else:
-                Color(0.30, 0.40, 0.55, 0.5)
-            card._bg_border = RoundedRectangle(
-                pos=card.pos, size=card.size, radius=[dp(6)])
-        # Aggiorna il rettangolo quando il widget si riposiziona
-        def _upd_rect(w, *_):
-            try:
-                card._bg_rect.pos = w.pos; card._bg_rect.size = w.size
-                card._bg_border.pos = w.pos; card._bg_border.size = w.size
-            except Exception: pass
-        card.bind(pos=_upd_rect, size=_upd_rect)
-
-        # Header riga: orizzonte + badge ALERT se serve
-        h_row = BoxLayout(orientation='horizontal',
-                           size_hint_y=None, height=dp(22))
-        hrz_lbl = Label(text=f'+{hours}h', font_size=sp(15), bold=True,
-                         color=ACCENT, halign='left', valign='middle')
-        hrz_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        h_row.add_widget(hrz_lbl)
-        if alert:
-            al = Label(text='[ALERT]', font_size=sp(13), bold=True,
-                        color=RED, halign='right', valign='middle')
-            al.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-            h_row.add_widget(al)
-        card.add_widget(h_row)
-
-        # Vento principale (grande): "12 kn  W"
-        if ws is not None:
-            wd_str = self.deg_to_cardinal(agg.get('wind_direction'))
-            txt = f'{ws:.0f} kn  {wd_str}'
+    def _refresh_upload_ui(self):
+        """Aggiorna la label upload con stato coda + esito ultimo tentativo."""
+        tu = getattr(self.dm, 'track_uploader', None)
+        if not tu:
+            self._upload_status.text = '--'
+            return
+        n = tu.queue_size()
+        parts = []
+        if n == 0:
+            parts.append('Coda vuota')
         else:
-            txt = '-- kn'
-        wind_lbl = Label(text=txt, font_size=sp(28), bold=True, color=WHITE,
-                          size_hint_y=None, height=dp(40),
-                          halign='center', valign='middle')
-        wind_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        card.add_widget(wind_lbl)
+            parts.append(f'{n} file in coda')
+        if tu.last_uploaded_filename:
+            ts = tu.last_uploaded_ts
+            if ts:
+                age = max(0, int(time.time() - ts))
+                if age < 60:
+                    parts.append(f'Ultimo: {tu.last_uploaded_filename} ({age}s fa)')
+                elif age < 3600:
+                    parts.append(f'Ultimo: {tu.last_uploaded_filename} ({age//60}m fa)')
+                else:
+                    parts.append(f'Ultimo: {tu.last_uploaded_filename}')
+        if tu.last_error:
+            parts.append(f'Err: {tu.last_error[:40]}')
+        self._upload_status.text = '\n'.join(parts)
+        # Colore in base allo stato
+        if tu.last_error and n > 0:
+            self._upload_status.color = ORANGE
+        elif n > 0:
+            self._upload_status.color = MUTED
+        elif tu.last_uploaded_ts:
+            self._upload_status.color = GREEN
+        else:
+            self._upload_status.color = MUTED
 
-        # Raffica
-        wg = agg.get('wind_gusts')
-        gust_txt = f'Raffica max: {wg:.0f} kn' if wg is not None else 'Raffica: --'
-        gust_color = RED if (wg and wg >= thr.get('gust', 28)) else MUTED
-        gust_lbl = Label(text=gust_txt, font_size=sp(13), color=gust_color,
-                          size_hint_y=None, height=dp(20),
-                          halign='center', valign='middle')
-        gust_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        card.add_widget(gust_lbl)
+    def _draw_chart(self,*_):
+        w=self._chart
+        try:
+            if w.get_root_window() is None: return
+            if w.width<dp(10) or w.height<dp(10): return
+            w.canvas.clear()
+        except Exception: return
+        if len(self._hist)<2: return
+        cw,ch=w.width,w.height; mx=max(self._hist) or 1
+        hist=self._hist[-120:]; n=len(hist); pts=[]
+        for i,v in enumerate(hist):
+            x=w.x+dp(5)+i*(cw-dp(10))/max(n-1,1)
+            y=w.y+dp(5)+(v/mx)*(ch-dp(10)); pts+=[x,y]
+        with w.canvas:
+            Color(*MUTED[:3],0.15)
+            for i in range(1,4):
+                yy=w.y+(ch/4)*i; Line(points=[w.x,yy,w.x+cw,yy],width=dp(0.5))
+            Color(*WHITE[:3],0.3)
+            Line(points=[w.x+dp(4),w.y+ch-dp(4),w.x+dp(4),w.y+dp(4),
+                          w.x+cw-dp(4),w.y+dp(4)],width=dp(1))
+            Color(*ACCENT)
+            if len(pts)>=4: Line(points=pts,width=dp(2))
 
-        # Onda + pioggia
-        wave = agg.get('wave_height')
-        prec = agg.get('precipitation')
-        wave_str = f'{wave:.1f}m' if wave is not None else '--'
-        prec_str = f'{prec:.1f}mm/h' if prec is not None else '--'
-        oc_color = WHITE
-        if (wave and wave >= thr.get('wave', 2.0)) or \
-           (prec and prec >= thr.get('precip', 2.0)):
-            oc_color = ORANGE
-        oc_lbl = Label(text=f'Onda: {wave_str}    Pioggia: {prec_str}',
-                        font_size=sp(13), color=oc_color,
-                        size_hint_y=None, height=dp(20),
-                        halign='center', valign='middle')
-        oc_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        card.add_widget(oc_lbl)
-        return card
-
-    def _check_alert(self, agg, thr):
-        """True se almeno UNA metrica supera la soglia corrispondente."""
-        ws = agg.get('wind_speed')
-        wg = agg.get('wind_gusts')
-        wave = agg.get('wave_height')
-        prec = agg.get('precipitation')
-        if ws is not None and ws >= thr.get('wind', 22.0):    return True
-        if wg is not None and wg >= thr.get('gust', 28.0):    return True
-        if wave is not None and wave >= thr.get('wave', 2.0): return True
-        if prec is not None and prec >= thr.get('precip', 2.0): return True
-        return False
-
-    def _render_table(self):
-        """Tabella con dettaglio per waypoint a +0h e +12h.
-        Colonne: Waypoint | +0h: vento (kn) dir / raffica / onda
-                          | +12h: vento (kn) dir / raffica / onda"""
-        # Sezione titolo
-        title = Label(text='Dettaglio per waypoint (+0h / +12h)',
-                        font_size=sp(18), color=ACCENT, bold=True,
-                        size_hint_y=None, height=dp(34),
-                        halign='left', valign='middle')
-        title.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        self._body_box.add_widget(title)
-
-        from kivy.uix.gridlayout import GridLayout
-        thr = (self._forecast.get('thresholds') or self.DEFAULT_THR)
-        wps = self._forecast.get('waypoints') or []
-        # Header + righe = (1 + len(wps))
-        n_rows = 1 + len(wps)
-        grid = GridLayout(cols=4, size_hint_y=None,
-                           row_default_height=dp(32),
-                           row_force_default=True,
-                           spacing=(dp(2), dp(2)))
-        grid.height = dp(32) * n_rows + dp(2) * (n_rows - 1)
-
-        def _hdr(text):
-            l = Label(text=text, font_size=sp(13), bold=True, color=ACCENT,
-                       halign='center', valign='middle')
-            l.bind(size=lambda lab, _: setattr(lab, 'text_size', lab.size))
-            return l
-
-        def _cell(text, color=WHITE):
-            l = Label(text=text, font_size=sp(13), color=color,
-                       halign='center', valign='middle')
-            l.bind(size=lambda lab, _: setattr(lab, 'text_size', lab.size))
-            return l
-
-        grid.add_widget(_hdr('Waypoint'))
-        grid.add_widget(_hdr('+0h vento/raff.'))
-        grid.add_widget(_hdr('+12h vento/raff.'))
-        grid.add_widget(_hdr('Onda max'))
-
-        for wp in wps:
-            name = wp.get('name', '?')
-            hh = wp.get('horizons') or {}
-            h0 = hh.get('0') or {}
-            h12 = hh.get('12') or {}
-            # +0h cell
-            ws0 = h0.get('wind_speed'); wg0 = h0.get('wind_gusts')
-            wd0 = h0.get('wind_direction')
-            txt0 = '--'
-            if ws0 is not None:
-                txt0 = f'{ws0:.0f}/{wg0:.0f} kn' if wg0 is not None else f'{ws0:.0f} kn'
-                txt0 += f' {self.deg_to_cardinal(wd0)}'
-            color0 = RED if (ws0 and ws0 >= thr.get('wind', 22.0)) else WHITE
-            # +12h cell
-            ws12 = h12.get('wind_speed'); wg12 = h12.get('wind_gusts')
-            wd12 = h12.get('wind_direction')
-            txt12 = '--'
-            if ws12 is not None:
-                txt12 = (f'{ws12:.0f}/{wg12:.0f} kn'
-                         if wg12 is not None else f'{ws12:.0f} kn')
-                txt12 += f' {self.deg_to_cardinal(wd12)}'
-            color12 = RED if (ws12 and ws12 >= thr.get('wind', 22.0)) else WHITE
-            # Onda max tra h0 e h12
-            wave_max = None
-            for hd in (h0, h12):
-                w = hd.get('wave_height')
-                if w is not None:
-                    wave_max = w if wave_max is None else max(wave_max, w)
-            wave_txt = f'{wave_max:.1f}m' if wave_max is not None else '--'
-            wave_color = (RED if (wave_max and wave_max >= thr.get('wave', 2.0))
-                          else WHITE)
-
-            grid.add_widget(_cell(name))
-            grid.add_widget(_cell(txt0, color0))
-            grid.add_widget(_cell(txt12, color12))
-            grid.add_widget(_cell(wave_txt, wave_color))
-
-        self._body_box.add_widget(grid)
-
-    def tick(self, dt):
-        # La WeatherScreen non ha aggiornamenti realtime; refresh manuale via
-        # pulsante "Aggiorna previsione". Tick e' no-op qui.
-        pass
-
-
+    def tick(self,dt):
+        super().tick(dt); dm=self.dm
+        self._rows['SOG kn'].text=f'{dm.boat_speed:.1f}'
+        self._rows['COG'].text   =f'{dm.boat_course:.0f}'
+        self._rows['HDG'].text   =f'{dm.boat_heading:.0f}'
+        self._rows['TWS kn'].text=f'{dm.true_wind_speed:.1f}'     if dm.true_wind_speed     else '--'
+        self._rows['TWA'].text   =f'{dm.true_wind_angle:.0f}'     if dm.true_wind_angle     else '--'
+        self._rows['AWS kn'].text=f'{dm.apparent_wind_speed:.1f}' if dm.apparent_wind_speed else '--'
+        self._rows['Depth m'].text=f'{dm.depth:.1f}'
+        self._rows['VMG kn'].text=f'{dm.vmg:.2f}'                 if dm.vmg                 else '--'
+        self._rows['Lat'].text   =f'{dm.gps_lat:.5f}'             if dm.gps_lat             else '--'
+        self._rows['Lon'].text   =f'{dm.gps_lon:.5f}'             if dm.gps_lon             else '--'
+        self._hist.append(dm.boat_speed)
+        if len(self._hist)>120: self._hist.pop(0)
+        # NB: NON scriviamo piu' qui il CSV. Lo fa il TrackLogger del dm
+        # con un timer dedicato a 5s, indipendente dalla schermata corrente.
+        self._refresh_log_ui()
+        Clock.schedule_once(lambda dt:self._draw_chart(),0)
 
 # =============================================================================
-# 8 -- IMPOSTAZIONI
+# 7 -- IMPOSTAZIONI
 # =============================================================================
 
 class SettingsScreen(TabScreen):
@@ -5589,36 +5544,76 @@ class SettingsScreen(TabScreen):
         sv_row.add_widget(mk_btn_gray('Path default',         self._reset_paths, sp(18)))
         left.add_widget(sv_row)
 
-        # NOTA: la sezione Azure Blob e' stata rimossa dalla UI per richiesta
-        # utente. Tutti i parametri sono editabili SOLO via sailing_config.json.
-        # Defaults applicati al primo avvio:
-        #   - cloud_boat_id    = 'soar'
-        #   - blob_base        = 'https://sailingapp.blob.core.windows.net'
-        #   - blob_account_key = chiave master dello storage account
+        # ---- SEZIONE AZURE BLOB STORAGE ----
+        # Identifica la barca (sottocartella nei container) e il base URL.
+        # I SAS token sono mostrati in sola lettura (presente/assente) per
+        # sicurezza: l'edit avviene via JSON.
+        left.add_widget(Label(text='AZURE BLOB',font_size=sp(18),color=ACCENT,
+                               bold=True,size_hint_y=None,height=dp(36)))
+        self._boat   = self._field(left, 'Boat ID:',
+                                    str(self.dm.cloud_boat_id or BOAT_ID_DEFAULT))
+        self._blob_b = self._field(left, 'Blob base:',
+                                    str(self.dm.blob_base or BLOB_BASE_DEFAULT))
+        # SAS token: 3 indicatori read-only (presente/vuoto). Tap apre _show_path
+        # per il riepilogo completo.
+        self._sas_lbl = Label(
+            text=self._format_sas_status(),
+            font_size=sp(13), color=MUTED,
+            halign='left', valign='middle',
+            size_hint_y=None, height=dp(70))
+        self._sas_lbl.bind(size=lambda l,_: setattr(l,'text_size',l.size))
+        left.add_widget(self._sas_lbl)
 
         left.add_widget(Widget())
         self._cols.add_widget(left)
 
-        # COLONNA DESTRA: utility (CLOUD UPLOAD spostato in LoggingScreen v1.18)
+        # COLONNA DESTRA: CLOUD + utility
         info=BoxLayout(orientation='vertical',spacing=dp(8),
                         padding=dp(14),size_hint_x=0.45)
         _bg(info,PANEL)
-        info.add_widget(Label(text='UTILITY',font_size=sp(18),color=ACCENT,
+
+        # ---- SEZIONE CLOUD UPLOAD ----
+        info.add_widget(Label(text='CLOUD UPLOAD',font_size=sp(18),color=ACCENT,
                                bold=True,size_hint_y=None,height=dp(36)))
-        info.add_widget(Label(
-            text='Le impostazioni CLOUD UPLOAD (snapshot live verso il database\n'
-                 'SQL del backend) sono ora nella schermata LOG. Qui restano\n'
-                 'solo i pulsanti diagnostici.',
-            font_size=sp(14), color=MUTED,
-            size_hint_y=None, height=dp(120),
-            halign='left', valign='top'))
-        # Tre pulsanti azione su un'unica riga
+        # Toggle ON/OFF
+        en_row=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
+        self._cloud_on  = mk_btn('ON',  lambda: self._set_cloud_enabled(True),  sp(18))
+        self._cloud_off = mk_btn('OFF', lambda: self._set_cloud_enabled(False), sp(18))
+        en_row.add_widget(self._cloud_on); en_row.add_widget(self._cloud_off)
+        info.add_widget(en_row)
+        # NB: il box di stato cloud (self._cloud_st) e' stato rimosso da qui:
+        # le stesse informazioni sono ora consolidate nella LoggingScreen
+        # (sezione UPLOAD CLOUD + LOG ERRORI). In Settings teniamo solo i
+        # toggle e i pulsanti di gestione, per non duplicare informazione.
+        # Token: mascherato per sicurezza, click apre il popup riepilogo
+        self._cloud_tok_lbl = Button(
+            text=self._mask_token(self.dm.cloud_token),
+            font_size=sp(13), color=WHITE,
+            background_color=PANEL, background_normal='',
+            halign='left', valign='middle',
+            size_hint_y=None, height=dp(50))
+        self._cloud_tok_lbl.bind(size=lambda l,_: setattr(l,'text_size',l.size))
+        self._cloud_tok_lbl.bind(on_release=lambda _: self._show_path())
+        info.add_widget(self._cloud_tok_lbl)
+        # Frequenza preset
+        self._cloud_freq_btns = {}
+        fr_row = BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(56))
+        for m in (5, 10, 15, 30):
+            b = mk_btn(f'{m}m', lambda mm=m: self._set_cloud_freq(mm), sp(16))
+            self._cloud_freq_btns[m] = b
+            fr_row.add_widget(b)
+        info.add_widget(fr_row)
+        # I 3 pulsanti azione su un'unica riga: label brevi per stare in larghezza
         action_row=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
-        action_row.add_widget(mk_btn_gray('Valori path', self._show_path,  sp(14)))
-        action_row.add_widget(mk_btn_gray('Ric. conf',   self._reload_cfg, sp(14)))
+        action_row.add_widget(mk_btn_gray('Valori path', self._show_path,       sp(14)))
+        action_row.add_widget(mk_btn_gray('Invia',       self._cloud_send_now,  sp(14)))
+        action_row.add_widget(mk_btn_gray('Ric. conf',   self._reload_cfg,      sp(14)))
         info.add_widget(action_row)
         info.add_widget(Widget())
         self._cols.add_widget(info)
+
+        # Inizializza highlight pulsanti cloud
+        self._refresh_cloud_buttons()
 
     def _do_resize(self,dt): pass
 
@@ -5642,6 +5637,19 @@ class SettingsScreen(TabScreen):
         # Valori effettivamente in memoria (dopo _load_cfg)
         bid_disp = dm.cloud_boat_id if dm.cloud_boat_id else '(VUOTO)'
         tok_disp = '(impostato)' if dm.cloud_token else '(VUOTO)'
+        # Stato SAS token (mostra solo se sono settati, mai il valore)
+        tracks_sas_disp    = '(impostato)' if dm.tracks_sas_token    else '(VUOTO)'
+        polars_sas_disp    = '(impostato)' if dm.polars_sas_token    else '(VUOTO)'
+        waypoints_sas_disp = '(impostato)' if dm.waypoints_sas_token else '(VUOTO)'
+        # URL composti per i tre flussi blob
+        wp_url    = dm.download_waypoints_url() or '(boat_id mancante)'
+        po_url    = dm.download_polar_url()     or '(boat_id mancante)'
+        tracks_url_pattern = (
+            f'{(dm.blob_base or "").rstrip("/")}'
+            f'/{BLOB_CONTAINER_TRACKS}/{bid_disp}/<filename>.csv')
+        trackslive_url_pattern = (
+            f'{(dm.blob_base or "").rstrip("/")}'
+            f'/{BLOB_CONTAINER_TRACKSLIVE}/{bid_disp}/<timestamp>.json')
         msg = (f"--- PATH ---\n"
                 f"Config:     {dm.config_path}  ({cfg_size})\n"
                 f"Polare:     {dm.polar_path}\n"
@@ -5652,12 +5660,22 @@ class SettingsScreen(TabScreen):
                 f"--- VALORI IN MEMORIA ---\n"
                 f"NMEA:        {dm.nmea_ip}:{dm.nmea_port}\n"
                 f"TWD window:  {dm.twd_window_minutes} min\n"
-                f"Cloud:       {'ON' if dm.cloud_enabled else 'OFF'} ({dm.cloud_interval_s}s)\n"
-                f"Cloud URL:   {dm.cloud_url}\n"
+                f"Cloud:       {'ON' if dm.cloud_enabled else 'OFF'} ({dm.cloud_interval_min}m)\n"
+                f"Cloud URL:   {dm.cloud_url}  (legacy, ignorato)\n"
                 f"Cloud BoatID:{bid_disp}\n"
                 f"Cloud Token: {tok_disp}\n"
                 f"Waypoints:   {len(dm.waypoints)}\n"
                 f"Boa attiva:  {dm.target_mark or '(nessuna)'}\n\n"
+                f"--- AZURE BLOB STORAGE ---\n"
+                f"Blob base:   {dm.blob_base}\n"
+                f"Boat:        {bid_disp}\n"
+                f"Waypoints:   {wp_url}\n"
+                f"Polare:      {po_url}\n"
+                f"Tracks:      {tracks_url_pattern}\n"
+                f"Live:        {trackslive_url_pattern}\n"
+                f"SAS tracks:    {tracks_sas_disp}\n"
+                f"SAS polars:    {polars_sas_disp}\n"
+                f"SAS waypoints: {waypoints_sas_disp}\n\n"
                 f"--- FILE GREZZO sul disco ---\n"
                 f"{cfg_raw}")
         # Uso ScrollView se il testo e' lungo
@@ -5675,10 +5693,18 @@ class SettingsScreen(TabScreen):
         try:
             self.dm._load_cfg()
             # Aggiorna le label read-only nella UI
+            self._cloud_tok_lbl.text = self._mask_token(self.dm.cloud_token)
             self._ip.text   = str(self.dm.nmea_ip)
             self._port.text = str(self.dm.nmea_port)
-            # boat_id, blob_base e blob_account_key: solo via JSON, niente UI
+            # Refresh campi blob editabili
+            if hasattr(self, '_boat'):
+                self._boat.text = str(self.dm.cloud_boat_id or BOAT_ID_DEFAULT)
+            if hasattr(self, '_blob_b'):
+                self._blob_b.text = str(self.dm.blob_base or BLOB_BASE_DEFAULT)
+            if hasattr(self, '_sas_lbl'):
+                self._sas_lbl.text = self._format_sas_status()
             self._refresh_twd_buttons()
+            self._refresh_cloud_buttons()
             Popup(title='OK',
                   content=Label(text='Config ricaricato dal file.\n'
                                        'Tap "Valori path" per\n'
@@ -5732,8 +5758,12 @@ class SettingsScreen(TabScreen):
                 self.dm.nmea_port = int(self._port.text.strip())
             except ValueError:
                 self.dm.nmea_port = self._port.text.strip()  # tieni come stringa, _load_cfg gestira'
-            # boat_id, blob_base e SAS token: gestiti SOLO via sailing_config.json
-            # (no UI). Restano i valori caricati in memoria.
+            # Boat ID: se l'utente lo cancella, applica default
+            bid = self._boat.text.strip() if hasattr(self, '_boat') else ''
+            self.dm.cloud_boat_id = bid if bid else BOAT_ID_DEFAULT
+            # Blob base: rimuovi trailing slash e applica default se vuoto
+            bb = self._blob_b.text.strip().rstrip('/') if hasattr(self, '_blob_b') else ''
+            self.dm.blob_base = bb if bb else BLOB_BASE_DEFAULT
         except Exception as e:
             print(f'_save_cfg commit fields: {e}')
 
@@ -5747,7 +5777,7 @@ class SettingsScreen(TabScreen):
                 summary = (f'IP: {self.dm.nmea_ip}:{self.dm.nmea_port}\n'
                             f'TWD window: {self.dm.twd_window_minutes} min\n'
                             f'Cloud: {"ON" if self.dm.cloud_enabled else "OFF"} '
-                            f'({self.dm.cloud_interval_s} s)\n'
+                            f'({self.dm.cloud_interval_min} min)\n'
                             f'Boat ID: {self.dm.cloud_boat_id or "(vuoto)"}')
                 msg = (f'Salvato {os.path.getsize(cfg)} byte in:\n{cfg}\n\n'
                         f'{summary}')
@@ -5792,9 +5822,57 @@ class SettingsScreen(TabScreen):
 
     # ---- Cloud upload helpers ----
 
-    # NOTA: i metodi _set_cloud_enabled, _set_cloud_freq, _refresh_cloud_buttons,
-    # _cloud_send_now sono stati spostati nella LoggingScreen (v1.18) insieme
-    # all'intera UI di gestione cloud.
+    def _set_cloud_enabled(self, enabled):
+        """Toggle ON/OFF del cloud uploader."""
+        self.dm.cloud_enabled = enabled
+        self.dm.save_cfg_safe()
+        if enabled:
+            self.dm.cloud.start()
+        else:
+            self.dm.cloud.stop()
+        self._refresh_cloud_buttons()
+
+    def _set_cloud_freq(self, minutes):
+        """Frequenza upload (5/10/15/30 min)."""
+        if minutes not in (5, 10, 15, 30):
+            return
+        self.dm.cloud_interval_min = minutes
+        self.dm.save_cfg_safe()
+        self._refresh_cloud_buttons()
+
+    def _refresh_cloud_buttons(self):
+        """Evidenzia ON/OFF e il pulsante di frequenza attivo."""
+        # ON/OFF
+        if self.dm.cloud_enabled:
+            self._cloud_on.background_color  = GREEN
+            self._cloud_on.color             = (0, 0, 0, 1)
+            self._cloud_off.background_color = BTN_GRAY
+            self._cloud_off.color            = WHITE
+        else:
+            self._cloud_on.background_color  = BTN_GRAY
+            self._cloud_on.color             = WHITE
+            self._cloud_off.background_color = RED
+            self._cloud_off.color            = (0, 0, 0, 1)
+        # Frequenza
+        cur = self.dm.cloud_interval_min
+        for m, btn in self._cloud_freq_btns.items():
+            if m == cur:
+                btn.background_color = ACCENT
+                btn.color = (0, 0, 0, 1)
+            else:
+                btn.background_color = BTN_GRAY
+                btn.color = WHITE
+
+    def _cloud_send_now(self):
+        """Trigger manuale di un invio immediato. I valori usati sono quelli
+        in self.dm (caricati dal config.json)."""
+        ok, err = self.dm.cloud.trigger_now()
+        if ok:
+            Popup(title='Invio',content=Label(text='Invio in corso...'),
+                  size_hint=(0.4,0.20)).open()
+        else:
+            Popup(title='Attendi',content=Label(text=err or 'Rate-limited'),
+                  size_hint=(0.4,0.20)).open()
 
     def _reset_cloud_url(self):
         """Ripristina l'URL del webhook di default e salva nel config."""
@@ -5820,6 +5898,20 @@ class SettingsScreen(TabScreen):
         if not token: return '(non impostato)'
         if len(token) <= 8: return '*' * len(token)
         return f'{token[:4]}...{token[-4:]}  ({len(token)} car.)'
+
+    def _format_sas_status(self):
+        """Riassunto stato SAS token (presente/vuoto) per la label di Settings.
+        Non mostra MAI il valore del token a video, per sicurezza."""
+        dm = self.dm
+        def m(t):
+            t = (t or '').strip()
+            if not t:
+                return 'VUOTO'
+            return f'OK ({len(t)} car.)'
+        return ('SAS TOKEN (edit via JSON):\n'
+                f'  tracks:    {m(dm.tracks_sas_token)}\n'
+                f'  polars:    {m(dm.polars_sas_token)}\n'
+                f'  waypoints: {m(dm.waypoints_sas_token)}')
 
     def _field(self,parent,label,value,kbtype='text'):
         """Campo testo editabile (label sx + TextInput dx)."""
@@ -5851,8 +5943,15 @@ class SettingsScreen(TabScreen):
         super().tick(dt)
         if self.dm.connected: self._conn.text='Connesso'; self._conn.color=GREEN
         else: self._conn.text='Non connesso'; self._conn.color=RED
-        # NOTA: aggiornamento status cloud rimosso v1.18: la UI cloud e' stata
-        # spostata nella LoggingScreen che ha il suo tick dedicato.
+        # Status cloud uploader: e' stato spostato in LoggingScreen (sezione
+        # UPLOAD CLOUD). Qui in Settings non aggiorniamo piu' una label di
+        # stato dedicata: il box nero _cloud_st e' stato rimosso a favore di
+        # una UI piu' pulita. Lo stato si vede in Logging o nei popup
+        # "Valori path" / "Invia" che gia' presenti in questa schermata.
+        # Aggiorna lo stato SAS token (in caso l'utente abbia editato il
+        # JSON e fatto "Ric. conf")
+        if hasattr(self, '_sas_lbl'):
+            self._sas_lbl.text = self._format_sas_status()
 
 # =============================================================================
 # APP
@@ -5860,12 +5959,20 @@ class SettingsScreen(TabScreen):
 
 class SailingTabletApp(App):
     def build(self):
+        # Installa hook globali per catturare TUTTE le eccezioni non gestite
+        # (main thread, thread Kivy/uploader, librerie). Da qui in poi ogni
+        # crash finisce nel file errors_YYYY-MM-DD.log oltre che in logcat.
+        try:
+            _error_logger.install_global_hooks()
+            log_err(f'App start: pid={os.getpid()} android={IS_ANDROID}')
+        except Exception as e:
+            print(f'ErrorLogger hook install failed: {e}')
+
         Window.clearcolor=BG
         self.dm=DataManager()
         self.sm=ScreenManager(transition=FadeTransition(duration=0.10))
         for cls in (NavigationScreen,StartLineScreen,LayLineScreen,
-                    WaypointsScreen,PolarScreen,LoggingScreen,WeatherScreen,
-                    SettingsScreen):
+                    WaypointsScreen,PolarScreen,LoggingScreen,SettingsScreen):
             self.sm.add_widget(cls(self.dm))
         self.sidebar=Sidebar(self.sm)
         root=BoxLayout(orientation='horizontal',spacing=0)
@@ -5899,7 +6006,7 @@ class SailingTabletApp(App):
     def on_stop(self):
         try: self.dm.cloud.stop()
         except: pass
-        # Chiudi il file CSV se ancora aperto, cosi' i dati flushed sopravvivono
+        # Chiudi il file di log se ancora aperto, cosi' i dati flushed sopravvivono
         try: self.dm.track_logger.stop()
         except: pass
         self.dm.disconnect()
