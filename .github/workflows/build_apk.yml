@@ -14,24 +14,27 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Python 3.11
+    - name: Set up Python 3.11.9
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        # Pin exact patch version. '3.11' resolves to latest (currently 3.11.15)
+        # which ships a broken pip vendor tree (resolvelib ImportError on venv create).
+        # Also matches P4A_python3_VERSION so host and target stay aligned.
+        python-version: '3.11.9'
 
     - name: Cache buildozer global
       uses: actions/cache@v4
       with:
         path: ~/.buildozer
-        key: buildozer-global-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-        restore-keys: buildozer-global-${{ runner.os }}-
+        key: buildozer-global-${{ runner.os }}-py3.11.9-${{ hashFiles('buildozer.spec') }}
+        restore-keys: buildozer-global-${{ runner.os }}-py3.11.9-
 
     - name: Cache buildozer local
       uses: actions/cache@v4
       with:
         path: .buildozer
-        key: buildozer-local-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-        restore-keys: buildozer-local-${{ runner.os }}-
+        key: buildozer-local-${{ runner.os }}-py3.11.9-${{ hashFiles('buildozer.spec') }}
+        restore-keys: buildozer-local-${{ runner.os }}-py3.11.9-
 
     - name: Install system dependencies
       run: |
@@ -43,7 +46,10 @@ jobs:
 
     - name: Install Python dependencies
       run: |
-        pip install --upgrade pip
+        # Pin pip below 24.2 to avoid the resolvelib API churn that broke
+        # pip._vendor.resolvelib.structs.RequirementInformation imports.
+        # The p4a venv inherits this pip, so the venv stays sane too.
+        python -m pip install --upgrade 'pip<24.2' 'setuptools<70' wheel
         pip install cython==0.29.37
         pip install buildozer==1.5.0
         pip install python-for-android==2023.5.21
