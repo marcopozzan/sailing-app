@@ -700,7 +700,6 @@ class ErrorLogger:
                     headers={
                         'Content-Type':   'text/plain; charset=utf-8',
                         'x-ms-blob-type': 'BlockBlob',
-                        'Content-Length': str(len(data)),
                     })
                 azure_sign_request(req, account_name, dm.blob_account_key)
                 ctx = _SSL_CTX_VERIFIED or ssl.create_default_context()
@@ -1769,7 +1768,6 @@ class CloudUploader:
                 headers={
                     'Content-Type':   'application/json',
                     'x-ms-blob-type': 'BlockBlob',
-                    'Content-Length': str(len(data)),
                 })
             azure_sign_request(req, account_name, account_key)
             sock_factory = self._cellular_socket_factory()
@@ -1793,22 +1791,28 @@ class CloudUploader:
 
         except ssl.SSLError as e:
             reason = getattr(e, 'reason', None) or str(e)
+            log_err(f'CloudUploader PUT SSL: {reason}', exc=e)
             return False, f'SSL: {reason}'
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode('utf-8', errors='replace')[:200]
             except Exception:
                 body = ''
+            log_err(f'CloudUploader PUT HTTP {e.code} on {url}: {body[:400]}')
             return False, f'HTTP {e.code}: {body}'.strip()
         except urllib.error.URLError as e:
             r = getattr(e, 'reason', e)
             if isinstance(r, ssl.SSLError):
                 reason = getattr(r, 'reason', None) or str(r)
+                log_err(f'CloudUploader PUT URL/SSL: {reason}')
                 return False, f'SSL: {reason}'
+            log_err(f'CloudUploader PUT URL: {r}')
             return False, f'URL: {r}'
         except socket.timeout:
+            log_err(f'CloudUploader PUT timeout on {url}')
             return False, 'Timeout'
         except Exception as e:
+            log_err(f'CloudUploader PUT: {type(e).__name__}: {e}', exc=e)
             return False, f'{type(e).__name__}: {e}'
 
     def _cellular_socket_factory(self):
@@ -5271,15 +5275,9 @@ class LoggingScreen(TabScreen):
         right = BoxLayout(orientation='vertical', spacing=dp(8),
                            padding=dp(12), size_hint_x=0.5)
         _bg(right, PANEL)
-        right.add_widget(Label(text='CLOUD UPLOAD LIVE', font_size=sp(20),
-                                 color=ACCENT, bold=True,
-                                 size_hint_y=None, height=dp(40)))
-        right.add_widget(Label(
-            text='Invia uno snapshot HTTPS ogni N secondi al backend.\n'
-                 'Il backend scrive su SQL Server (tabella "traks").',
-            font_size=sp(13), color=MUTED,
-            size_hint_y=None, height=dp(60),
-            halign='center', valign='middle'))
+        # Titolo "CLOUD UPLOAD LIVE" e descrizione rimossi nella v1.20 per
+        # pulire la UI. La sezione e' visivamente delimitata dal panel e dai
+        # pulsanti ON/OFF + selettore frequenza.
 
         # Toggle ON/OFF (due pulsanti)
         en_row = BoxLayout(spacing=dp(6), size_hint_y=None, height=dp(60))
@@ -5308,19 +5306,10 @@ class LoggingScreen(TabScreen):
             fr_row.add_widget(b)
         right.add_widget(fr_row)
 
-        # Status cloud (multi-linea)
-        right.add_widget(Label(text='Stato:',
-                                 font_size=sp(15), color=MUTED,
-                                 size_hint_y=None, height=dp(28),
-                                 halign='left', valign='middle'))
-        self._cloud_status = Label(text='--', font_size=sp(15),
-                                     color=MUTED, halign='left', valign='top',
-                                     size_hint_y=None, height=dp(180))
-        self._cloud_status.bind(
-            size=lambda l, _: setattr(l, 'text_size', l.size))
-        _bg(self._cloud_status, BG)
-        right.add_widget(self._cloud_status)
-
+        # Stato cloud rimosso dalla UI (v1.20): il box nero "Stato:" e' stato
+        # eliminato per pulire la pagina. Eventuali messaggi di errore del
+        # CloudUploader finiscono nel log errori (visibile sotto in LOG ERRORI
+        # tramite il contatore "N errori catturati").
         # Pulsante "Invia ora" (forza un ciclo immediato)
         self._cloud_send_btn = mk_btn_gray('Invia subito',
                                              self._cloud_send_now, sp(16))
@@ -5477,13 +5466,16 @@ class LoggingScreen(TabScreen):
         self._refresh_cloud_buttons()
 
     def _cloud_send_now(self, *_):
+        """Forza un ciclo di upload immediato. Feedback via popup breve perche'
+        il box di stato e' stato rimosso dalla UI (v1.20)."""
         ok, err = self.dm.cloud.trigger_now()
         if ok:
-            self._cloud_status.text = (self._cloud_status.text +
-                                          '\n[Invio manuale lanciato]')
+            msg = 'Invio manuale lanciato'
         else:
-            self._cloud_status.text = (self._cloud_status.text +
-                                          f'\n[Attendi: {err}]')
+            msg = f'Attendi: {err}' if err else 'Rate-limited'
+        Popup(title='Invio cloud',
+              content=Label(text=msg, halign='center', valign='middle'),
+              size_hint=(0.5, 0.22)).open()
 
     # ------------------------------------------------------------------
     # Upload log errori al cloud
@@ -5547,40 +5539,14 @@ class LoggingScreen(TabScreen):
                 btn.background_color = BTN_GRAY
                 btn.color = WHITE
 
-    def _refresh_cloud_status(self):
-        cu = self.dm.cloud
-        running = cu.is_running()
-        last_str = '--'
-        if cu.last_sent_ts:
-            last_str = datetime.fromtimestamp(
-                cu.last_sent_ts).strftime('%H:%M:%S')
-        qsize = cu.queue_size()
-        state = ('ATTIVO' if (self.dm.cloud_enabled and running)
-                 else 'INATTIVO')
-        # Costruisco messaggio multi-linea
-        lines = [f'Stato: {state}',
-                 f'Inviati: {cu.sent_count}',
-                 f'Ultimo: {last_str}',
-                 f'In coda: {qsize}',
-                 f'URL: {self.dm.cloud_url[:50]}...'
-                    if len(self.dm.cloud_url) > 50 else
-                    f'URL: {self.dm.cloud_url}']
-        if cu.last_error:
-            err_msg = cu.last_error[:120]
-            lines.append(f'ERRORE: {err_msg}')
-        self._cloud_status.text = '\n'.join(lines)
-        # Colore status
-        if not self.dm.cloud_enabled:
-            self._cloud_status.color = MUTED
-        elif cu.last_error:
-            self._cloud_status.color = ORANGE
-        else:
-            self._cloud_status.color = GREEN
+    # _refresh_cloud_status rimosso nella v1.20: aggiornava il box "Stato:"
+    # nero che e' stato eliminato dalla UI. Gli errori del CloudUploader
+    # vengono ora registrati nel log errori (visibili sotto in "LOG ERRORI"
+    # tramite il contatore "N errori catturati").
 
     def tick(self, dt):
         super().tick(dt)
         self._refresh_log_ui()
-        self._refresh_cloud_status()
         self._refresh_errlog_status()
 
     def _refresh_errlog_status(self):
@@ -6152,18 +6118,18 @@ class SettingsScreen(TabScreen):
         _bg(info,PANEL)
         info.add_widget(Label(text='UTILITY',font_size=sp(18),color=ACCENT,
                                bold=True,size_hint_y=None,height=dp(36)))
-        info.add_widget(Label(
-            text='Le impostazioni CLOUD UPLOAD (snapshot live verso il database\n'
-                 'SQL del backend) sono ora nella schermata LOG. Qui restano\n'
-                 'solo i pulsanti diagnostici.',
-            font_size=sp(14), color=MUTED,
-            size_hint_y=None, height=dp(120),
-            halign='left', valign='top'))
-        # Tre pulsanti azione su un'unica riga
+        # Label descrittiva rimossa nella v1.20.
+        # Tre pulsanti su due righe. Riga 1: diagnostica locale.
         action_row=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
         action_row.add_widget(mk_btn_gray('Valori path', self._show_path,  sp(14)))
         action_row.add_widget(mk_btn_gray('Ric. conf',   self._reload_cfg, sp(14)))
         info.add_widget(action_row)
+        # Riga 2: download config dal cloud (sovrascrive il file locale)
+        action_row2=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
+        action_row2.add_widget(mk_btn_gray('Scarica config dal cloud',
+                                             self._download_cfg_from_cloud,
+                                             sp(14)))
+        info.add_widget(action_row2)
         info.add_widget(Widget())
         self._cols.add_widget(info)
 
@@ -6235,6 +6201,90 @@ class SettingsScreen(TabScreen):
             Popup(title='Errore ricarica',
                   content=Label(text=f'{type(e).__name__}: {e}'),
                   size_hint=(0.6,0.3)).open()
+
+    def _download_cfg_from_cloud(self):
+        """Scarica sailing_config.json dal blob storage e sovrascrive il file
+        locale. Diverso da 'Ric. conf' che ricarica solo il file locale gia'
+        presente.
+
+        Pattern URL:
+            {blob_base}/config/{boat_id}/sailing_config.json
+
+        Usa Shared Key auth con blob_account_key. Dopo il download, ricarica
+        automaticamente il config (come 'Ric. conf') cosi' i valori sono
+        immediatamente attivi senza dover riavviare l'app.
+
+        Sicurezza: confermiamo con popup prima di sovrascrivere il file
+        locale, per non perdere modifiche fatte direttamente sul tablet.
+        """
+        # Conferma sovrascrittura
+        box = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(12))
+        box.add_widget(Label(
+            text='Scaricare il config dal cloud sovrascrive il file\n'
+                 'sailing_config.json locale. Procedere?',
+            halign='center', valign='middle'))
+        btn_row = BoxLayout(spacing=dp(8), size_hint_y=None, height=dp(56))
+        ok_btn = Button(text='Scarica', background_color=ACCENT,
+                         background_normal='', color=(0,0,0,1), bold=True)
+        ko_btn = Button(text='Annulla', background_color=BTN_GRAY,
+                         background_normal='', color=WHITE)
+        btn_row.add_widget(ok_btn); btn_row.add_widget(ko_btn)
+        box.add_widget(btn_row)
+        confirm_pop = Popup(title='Scarica config dal cloud', content=box,
+                             size_hint=(0.7, 0.4), auto_dismiss=False)
+        ko_btn.bind(on_release=lambda _: confirm_pop.dismiss())
+
+        def _do_download(*_):
+            confirm_pop.dismiss()
+            # Worker in thread separato per non bloccare la UI
+            status_lbl = Label(text='Download in corso...',
+                                halign='center', valign='middle')
+            wait_pop = Popup(title='Scarica config dal cloud',
+                              content=status_lbl,
+                              size_hint=(0.6, 0.3), auto_dismiss=False)
+            wait_pop.open()
+
+            def _worker():
+                dm = self.dm
+                ok, cloud_cfg, err = fetch_remote_config(
+                    dm.blob_base, dm.cloud_boat_id, dm.blob_account_key)
+
+                @mainthread
+                def _finish():
+                    wait_pop.dismiss()
+                    if not ok:
+                        Popup(title='Errore',
+                              content=Label(text=f'Download fallito:\n{err}',
+                                              halign='center',valign='middle'),
+                              size_hint=(0.6, 0.30)).open()
+                        return
+                    # Salva su disco e ricarica
+                    try:
+                        dm._apply_config(cloud_cfg)
+                        dm.save_cfg()
+                        # Aggiorna le label nella UI
+                        self._ip.text   = str(dm.nmea_ip)
+                        self._port.text = str(dm.nmea_port)
+                        self._refresh_twd_buttons()
+                        Popup(title='OK',
+                              content=Label(
+                                  text='Config scaricato dal cloud\n'
+                                       'e ricaricato.\n'
+                                       'Tap "Valori path" per verificare.',
+                                  halign='center', valign='middle'),
+                              size_hint=(0.6, 0.30)).open()
+                    except Exception as e:
+                        log_err(f'_download_cfg_from_cloud apply: {e}', exc=e)
+                        Popup(title='Errore apply',
+                              content=Label(
+                                  text=f'{type(e).__name__}: {e}',
+                                  halign='center', valign='middle'),
+                              size_hint=(0.6, 0.30)).open()
+                _finish()
+            threading.Thread(target=_worker, daemon=True).start()
+
+        ok_btn.bind(on_release=_do_download)
+        confirm_pop.open()
 
     def _request_storage(self):
         """Richiede permessi storage runtime (Android 6+).
