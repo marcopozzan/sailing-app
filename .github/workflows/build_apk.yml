@@ -30,15 +30,18 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.buildozer
-        key: buildozer-global-${{ runner.os }}-py3.11.9-${{ hashFiles('buildozer.spec') }}
-        restore-keys: buildozer-global-${{ runner.os }}-py3.11.9-
+        # v2: invalidata per pulire residui della patch precedente rotta.
+        key: buildozer-global-${{ runner.os }}-py3.11.9-v2-${{ hashFiles('buildozer.spec') }}
+        restore-keys: buildozer-global-${{ runner.os }}-py3.11.9-v2-
 
     - name: Cache buildozer local
       uses: actions/cache@v4
       with:
         path: .buildozer
-        key: buildozer-local-${{ runner.os }}-py3.11.9-${{ hashFiles('buildozer.spec') }}
-        restore-keys: buildozer-local-${{ runner.os }}-py3.11.9-
+        # v2: invalidata per forzare un clone p4a pulito (la versione precedente
+        # aveva pythonforandroid/build.py corrotto da una patch sbagliata).
+        key: buildozer-local-${{ runner.os }}-py3.11.9-v2-${{ hashFiles('buildozer.spec') }}
+        restore-keys: buildozer-local-${{ runner.os }}-py3.11.9-v2-
 
     - name: Install system dependencies
       run: |
@@ -80,7 +83,7 @@ jobs:
             grep "version = " "$FILE" | grep -v "#" | head -1
           fi
         done
-        # Patcha anche il clone locale di p4a (usato di fatto dal build)
+        # Patcha anche il clone locale di p4a (di fatto e' questo che verra' usato)
         python3 patch_p4a_pip.py
 
     - name: Build APK

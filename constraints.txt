@@ -1,7 +1,6 @@
 # Pin globale per evitare che pip 24.2+ rompa pip._vendor.resolvelib
 # (ImportError: cannot import name 'RequirementInformation' ...).
-# Questo file viene applicato anche dentro la venv di p4a tramite
-# la variabile d'ambiente PIP_CONSTRAINT impostata nel workflow.
+# Applicato anche dentro la venv di p4a tramite PIP_CONSTRAINT nel workflow.
 pip<24.2
 setuptools<70
 wheel
