@@ -2136,11 +2136,28 @@ class DataManager:
     def _apply_config(self, c):
         """Applica un dict di configurazione agli attributi del DataManager.
         Usato sia da default_config che da _load_cfg (post-parse JSON).
-        Esegue validazione di valori critici (frequenze ammesse)."""
+        Esegue validazione di valori critici (frequenze ammesse).
+
+        NOTA path sandbox (v1.20):
+        - polar_path e log_dir NON vengono letti dal config ma forzati ai
+          valori calcolati a runtime (POLAR_PATH, LOG_PATH che sono dentro
+          DATA_DIR, la sandbox dell'app). Motivo: tra release di Android, tra
+          aggiornamenti dell'app e tra dispositivi diversi, DATA_DIR cambia
+          (es. cambia package name o cambia external storage layout). Salvare
+          il path nel config porta a "permission denied" perche' l'app cerca
+          di scrivere in un path che non e' piu' la sua sandbox.
+        - Stessa cosa fanno waypoint e polari: usano sempre WAYPOINTS_PATH
+          e POLAR_PATH calcolati al boot, mai i path nel config.
+        - I valori restano nel JSON solo per visualizzazione (debug/info)
+          ma vengono SOVRASCRITTI al salvataggio successivo con i valori
+          correnti, garantendo che il file rifletta sempre lo stato reale.
+        """
         self.nmea_ip   = c.get('nmea_ip',   '192.168.4.1')
         self.nmea_port = c.get('nmea_port', 60001)
-        self.polar_path = c.get('polar_path', POLAR_PATH)
-        self.log_dir    = c.get('log_dir',    LOG_PATH)
+        # Forziamo SEMPRE i path sandbox calcolati a runtime, ignorando
+        # qualunque valore salvato nel config (puo' essere stale tra release).
+        self.polar_path = POLAR_PATH
+        self.log_dir    = LOG_PATH
         tw = c.get('twd_window_minutes', 5)
         self.twd_window_minutes = tw if tw in (2, 5, 10, 15, 20) else 5
         self.cloud_enabled      = bool(c.get('cloud_enabled', False))
