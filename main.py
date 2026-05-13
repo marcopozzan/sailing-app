@@ -481,6 +481,30 @@ def authorize_blob_request(req, dm):
     raise ValueError('Ne blob_sas_token ne blob_account_key configurati')
 
 
+def authorize_blob_request_sas_only(req, dm):
+    """Variante di authorize_blob_request() che usa ESCLUSIVAMENTE il SAS
+    token, senza fallback alla Account Key.
+
+    Usata per le operazioni sulle TRACCE (upload tracks CSV + upload
+    trackslive JSON live): per esplicita scelta dell'utente, queste
+    devono fallire in modo visibile se il SAS non e' presente o
+    invalido, invece di degradare silenziosamente alla chiave master.
+
+    Solleva ValueError se blob_sas_token e' vuoto.
+
+    Le altre operazioni (config, polari, waypoint, meteo, log errori)
+    continuano a usare authorize_blob_request() che e' SAS-first ma
+    accetta il fallback Account Key.
+    """
+    sas = (getattr(dm, 'blob_sas_token', '') or '').lstrip('?').strip()
+    if not sas:
+        raise ValueError('blob_sas_token non configurato (richiesto per le tracce)')
+    url = req.full_url
+    sep = '&' if ('?' in url) else '?'
+    req.full_url = f'{url}{sep}{sas}'
+    return req
+
+
 def get_data_dir():
     """Restituisce la directory dove salvare config, polari e log.
 
@@ -1072,12 +1096,18 @@ def default_config():
         'nmea_port':          60001,
         # Tattica: finestra TWD per analisi lato buono / vira (minuti)
         'twd_window_minutes': 5,
-        # Cloud upload live (snapshot periodico al blob 'trackslive')
+        # Cloud upload live (snapshot periodico)
+        # Dalla v1.21 i dati live NON vanno piu' al blob 'trackslive',
+        # vengono inviati a una Azure Function che li scrive su SQL Server.
+        # L'endpoint e' configurabile e protetto da Function Key.
         'cloud_enabled':      False,
         'cloud_boat_id':      BOAT_ID_DEFAULT,
         # Intervallo upload in secondi. Valori UI ammessi: 30,60,120,300,600.
-        # Min hard floor 30s nel CloudUploader._loop().
         'cloud_interval_s':   60,
+        # URL della Function ingest (HTTPS POST endpoint)
+        'cloud_api_url':      'https://sailing-ingest.azurewebsites.net/api/track',
+        # Function Key per autenticarsi alla Function
+        'cloud_api_key':      '',
         # === Azure Blob Storage ===
         # Due autenticazioni alternative supportate:
         # A) SAS token (preferita: piu' sicura, scade, permessi limitati)
@@ -1615,13 +1645,11 @@ class CloudUploader:
         if not self.dm.cloud_boat_id:
             self.last_error = 'cloud_boat_id non configurato'
             return
-        has_sas = bool((getattr(self.dm, 'blob_sas_token', '') or '').strip())
-        has_key = bool((getattr(self.dm, 'blob_account_key', '') or '').strip())
-        if not (has_sas or has_key):
-            self.last_error = 'ne blob_sas_token ne blob_account_key configurati'
+        if not (self.dm.cloud_api_url or '').strip():
+            self.last_error = 'cloud_api_url non configurato'
             return
-        if not (self.dm.blob_base or '').strip():
-            self.last_error = 'blob_base non configurato'
+        if not (self.dm.cloud_api_key or '').strip():
+            self.last_error = 'cloud_api_key non configurato'
             return
 
         # 1) Drena la coda offline (max 50 record per ciclo per non
@@ -1654,13 +1682,24 @@ class CloudUploader:
     # ----- snapshot dei dati -----
 
     def _build_snapshot(self):
-        """Raccoglie lo stato corrente del DataManager in dict JSON-friendly."""
+        """Raccoglie lo stato corrente del DataManager in dict JSON-friendly.
+
+        Aggiunge:
+        - request_id: UUID univoco per questo snapshot. La Function lo usa
+          come dedup key (UNIQUE constraint su SQL): se la coda offline
+          drena lo stesso snapshot due volte, la Function risponde 200
+          'duplicate' senza re-inserire.
+        - client_version: utile per troubleshooting lato server.
+        """
+        import uuid
         dm = self.dm
         advice, shift = dm.tactical_advice()
         twd_avg = dm.get_twd_average()
         snap = {
-            'boat_id': dm.cloud_boat_id,
-            'ts':      datetime.now(timezone.utc).isoformat(),
+            'boat_id':    dm.cloud_boat_id,
+            'ts':         datetime.now(timezone.utc).isoformat(),
+            'request_id': str(uuid.uuid4()),
+            'client_version': APP_VERSION if 'APP_VERSION' in globals() else 'sailing-1.21',
             'gps': {
                 'lat': dm.gps_lat,
                 'lon': dm.gps_lon,
@@ -1757,28 +1796,34 @@ class CloudUploader:
     # nei nomi blob su alcuni client). Un file per snapshot, niente collisioni.
 
     def _post_json(self, payload):
-        """PUT snapshot JSON al container 'trackslive' del blob storage.
+        """POST snapshot JSON all'endpoint Azure Function che lo scrive
+        su SQL Server. Sostituisce il vecchio PUT al blob trackslive.
+
+        Auth: Function Key in header 'x-functions-key'.
+
+        Idempotenza: l'app genera un request_id (UUID) lato client che la
+        Function usa come dedup key. Se la coda offline rispedisce lo
+        stesso snapshot, la Function risponde 200 senza duplicare.
 
         Restituisce (ok: bool, err: str|None). In caso di errore il chiamante
         accumula nella coda offline."""
-        # Genera filename univoco per questo snapshot
-        ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
-        filename = f'{ts}.json'
-
         if not self.dm.cloud_boat_id:
             return False, 'cloud_boat_id non configurato'
-        has_sas = bool((getattr(self.dm, 'blob_sas_token', '') or '').strip())
-        has_key = bool((getattr(self.dm, 'blob_account_key', '') or '').strip())
-        if not (has_sas or has_key):
-            return False, 'ne blob_sas_token ne blob_account_key configurati'
+        if not (self.dm.cloud_api_url or '').strip():
+            return False, 'cloud_api_url non configurato'
+        if not (self.dm.cloud_api_key or '').strip():
+            return False, 'cloud_api_key non configurato'
 
-        base = (self.dm.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
-        from urllib.parse import quote
-        safe = quote(filename, safe='._-')
-        url = (f'{base}/{BLOB_CONTAINER_TRACKSLIVE}/'
-               f'{self.dm.cloud_boat_id}/{safe}')
+        # Assicuriamoci che il payload abbia un request_id. Se manca (es.
+        # snapshot vecchio dalla coda offline pre-v1.21), ne generiamo uno
+        # qui: meglio una piccola perdita di idempotenza che bloccare il
+        # drain.
+        if 'request_id' not in payload:
+            import uuid
+            payload = dict(payload)
+            payload['request_id'] = str(uuid.uuid4())
 
-        return self._put_to_blob_attempt(url, payload, _SSL_CTX_VERIFIED)
+        return self._post_to_function(payload, _SSL_CTX_VERIFIED)
 
     def _is_test_host(self, url):
         """Legacy: usato in passato per il fallback SSL su webhook.site.
@@ -1791,28 +1836,28 @@ class CloudUploader:
         except Exception:
             return False
 
-    def _put_to_blob_attempt(self, url, payload, ssl_ctx):
-        """Singolo tentativo PUT al blob storage di UN snapshot JSON.
+    def _post_to_function(self, payload, ssl_ctx):
+        """Singolo tentativo POST all'Azure Function ingest che persiste
+        lo snapshot su SQL Server.
 
-        Header obbligatori Azure Blob:
-        - x-ms-blob-type: BlockBlob
-        - Content-Type:   application/json
-
-        Autenticazione delegata a authorize_blob_request(req, dm) che
-        sceglie SAS token o Shared Key in base a quale e' configurato.
+        Endpoint: self.dm.cloud_api_url
+        Auth: header 'x-functions-key' con self.dm.cloud_api_key
 
         Su Android forza la rete cellulare se disponibile (bypassa il WiFi
         di bordo senza uplink).
+
+        Restituisce (ok: bool, err: str|None). Restituisce True anche per
+        risposta 'duplicate' (200 OK con status='duplicate'): la Function
+        ha gia' lo snapshot, drenarlo dalla coda offline e' OK.
         """
         try:
             data = json.dumps(payload).encode('utf-8')
             req = urllib.request.Request(
-                url, data=data, method='PUT',
+                self.dm.cloud_api_url, data=data, method='POST',
                 headers={
-                    'Content-Type':   'application/json',
-                    'x-ms-blob-type': 'BlockBlob',
+                    'Content-Type':     'application/json',
+                    'x-functions-key':  self.dm.cloud_api_key,
                 })
-            authorize_blob_request(req, self.dm)
             sock_factory = self._cellular_socket_factory()
             if sock_factory:
                 orig = socket.create_connection
@@ -1834,28 +1879,28 @@ class CloudUploader:
 
         except ssl.SSLError as e:
             reason = getattr(e, 'reason', None) or str(e)
-            log_err(f'CloudUploader PUT SSL: {reason}', exc=e)
+            log_err(f'CloudUploader POST SSL: {reason}', exc=e)
             return False, f'SSL: {reason}'
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode('utf-8', errors='replace')[:200]
             except Exception:
                 body = ''
-            log_err(f'CloudUploader PUT HTTP {e.code} on {url}: {body[:400]}')
+            log_err(f'CloudUploader POST HTTP {e.code} on {self.dm.cloud_api_url}: {body[:400]}')
             return False, f'HTTP {e.code}: {body}'.strip()
         except urllib.error.URLError as e:
             r = getattr(e, 'reason', e)
             if isinstance(r, ssl.SSLError):
                 reason = getattr(r, 'reason', None) or str(r)
-                log_err(f'CloudUploader PUT URL/SSL: {reason}')
+                log_err(f'CloudUploader POST URL/SSL: {reason}')
                 return False, f'SSL: {reason}'
-            log_err(f'CloudUploader PUT URL: {r}')
+            log_err(f'CloudUploader POST URL: {r}')
             return False, f'URL: {r}'
         except socket.timeout:
-            log_err(f'CloudUploader PUT timeout on {url}')
+            log_err(f'CloudUploader POST timeout on {self.dm.cloud_api_url}')
             return False, 'Timeout'
         except Exception as e:
-            log_err(f'CloudUploader PUT: {type(e).__name__}: {e}', exc=e)
+            log_err(f'CloudUploader POST: {type(e).__name__}: {e}', exc=e)
             return False, f'{type(e).__name__}: {e}'
 
     def _cellular_socket_factory(self):
@@ -2222,6 +2267,9 @@ class DataManager:
         try: cs = int(cs)
         except (TypeError, ValueError): cs = 60
         self.cloud_interval_s = cs if cs in (30, 60, 120, 300, 600) else 60
+        # URL endpoint Azure Function + Function Key
+        self.cloud_api_url = (c.get('cloud_api_url', '') or '').strip()
+        self.cloud_api_key = (c.get('cloud_api_key', '') or '').strip()
         # === Azure Blob Storage ===
         bb = (c.get('blob_base', '') or '').strip().rstrip('/')
         self.blob_base = bb if bb else BLOB_BASE_DEFAULT
@@ -2396,6 +2444,8 @@ class DataManager:
                    'cloud_enabled':      self.cloud_enabled,
                    'cloud_boat_id':      self.cloud_boat_id,
                    'cloud_interval_s':   self.cloud_interval_s,
+                   'cloud_api_url':      self.cloud_api_url,
+                   'cloud_api_key':      self.cloud_api_key,
                    'blob_base':          self.blob_base,
                    'blob_sas_token':     self.blob_sas_token,
                    'blob_account_key':   self.blob_account_key,
@@ -2541,15 +2591,16 @@ class DataManager:
         Pattern URL: {blob_base}/tracks/{cloud_boat_id}/{filename}
         Restituisce (ok, msg).
 
-        Autenticazione: SAS token o Shared Key, vedi authorize_blob_request()."""
+        Autenticazione: SOLO SAS token (no Account Key fallback).
+        Per esplicita scelta dell'utente, le operazioni sulle tracce
+        richiedono SAS configurato — fallisce in modo visibile invece
+        di degradare alla chiave master."""
         if not os.path.exists(csv_path):
             return False, f'File non trovato: {csv_path}'
         if not self.cloud_boat_id:
             return False, 'cloud_boat_id non configurato'
-        has_sas = bool((getattr(self, 'blob_sas_token', '') or '').strip())
-        has_key = bool((getattr(self, 'blob_account_key', '') or '').strip())
-        if not (has_sas or has_key):
-            return False, 'ne blob_sas_token ne blob_account_key configurati'
+        if not (getattr(self, 'blob_sas_token', '') or '').strip():
+            return False, 'blob_sas_token non configurato (richiesto per tracce)'
         base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
         try:
             with open(csv_path, 'rb') as f:
@@ -2565,7 +2616,7 @@ class DataManager:
                 url, data=csv_data, method='PUT',
                 headers={'Content-Type': 'text/csv',
                          'x-ms-blob-type': 'BlockBlob'})
-            authorize_blob_request(req, self)
+            authorize_blob_request_sas_only(req, self)
             with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
                 if resp.status >= 300:
                     return False, f'HTTP {resp.status}'
@@ -3521,6 +3572,7 @@ class Sidebar(BoxLayout):
            ('Lay',       'layline'),
            ('WPT',       'waypoints'),
            ('Polar',     'polar'),
+           ('Meteo',     'weather'),
            ('Log',       'logging'),
            ('Set',       'settings')]
 
@@ -3528,12 +3580,9 @@ class Sidebar(BoxLayout):
         super().__init__(orientation='vertical',size_hint_x=None,
                          width=SIDEBAR_W,spacing=dp(2),padding=[dp(4),dp(8)],**kw)
         self.sm=sm; _bg(self,SIDEBAR)
-        # Logo testuale, niente emoji
-        logo=Label(text='Sailing\nRacing',font_size=sp(18),bold=True,
-                    color=ACCENT,size_hint_y=None,height=dp(84),
-                    halign='center',valign='middle')
-        logo.bind(size=logo.setter('text_size'))
-        self.add_widget(logo)
+        # Logo "Sailing Racing" rimosso (v1.20) per fare spazio al nuovo tab Meteo.
+        # Un piccolo spacer in cima da' aria visiva prima dei pulsanti.
+        self.add_widget(Widget(size_hint_y=None, height=dp(20)))
         self._btns={}
         for label,name in self.ITEMS:
             b=Button(text=label,font_size=sp(21),bold=True,
@@ -5585,78 +5634,95 @@ class LoggingScreen(TabScreen):
 # 7 -- METEO PREVISIONALE PER REGATA
 # =============================================================================
 # Schermata che visualizza le previsioni meteo per la regata caricate da
-# Azure Blob Storage. Il file sorgente e':
-#   {blob_base}/meteo/{cloud_boat_id}/forecast.json
+# Azure Blob Storage. Replica nel tablet l'aspetto del frontend web
+# (frontend/weather.js -> Riepilogo + Dettaglio waypoint).
 #
-# Il file e' generato dal backend (script periodico che chiama Open-Meteo)
-# e contiene previsioni gia' pre-elaborate per i waypoint della barca.
+# I file vengono caricati dal sito con nome timestampato:
+#   {blob_base}/meteo/{cloud_boat_id}/meteo-YYYY-MM-DD-HH-mm.json
 #
-# Formato JSON atteso (compatibile con il sito web in frontend/weather.js):
+# Schema JSON v1.0 (esempio in repo: meteo-soar-example.json):
 # {
-#   "generated_at": "2026-05-08T14:00:00Z",      # ISO timestamp generazione
-#   "boat_id": "soar",
-#   "model": "AROME HD",                          # nome modello meteo usato
-#   "reference_time": "2026-05-09T10:00:00Z",     # data partenza regata (opt)
-#   "thresholds": {                               # soglie alert (opt)
-#       "wind": 22, "gust": 28, "wave": 2.0, "precip": 2.0
+#   "schema_version": "1.0",
+#   "meta": {
+#     "boat_id": "soar", "boat_name": "Soar",
+#     "generated_at": "2026-05-08T12:30:00Z",
+#     "generated_by": "marco.pozzan",
+#     "source": {"provider":"open-meteo", "model":"meteofrance_arome_france_hd",
+#                "wind_unit":"kn", "wave_unit":"m", "precip_unit":"mm",
+#                "temperature_unit":"C", "pressure_unit":"hPa"},
+#     "reference_time": "2026-05-08T12:30:00Z",
+#     "reference_time_is_now": true,
+#     "horizons_h": [0, 6, 12, 24, 48]
 #   },
-#   "waypoints": [
-#     {
-#       "name": "Pin",
-#       "lat": 45.66, "lon": 13.78,
-#       "horizons": {                             # 4 orizzonti rispetto a ref_time
-#           "0":  {"ts": "...", "wind_speed": 12.0, "wind_direction": 280,
-#                  "wind_gusts": 18.0, "wave_height": 0.5,
-#                  "precipitation": 0, "temperature": 18},
-#           "6":  {...},
-#           "12": {...},
-#           "24": {...}
-#       }
-#     },
+#   "summary": [    # gia' aggregato lato server, una riga per orizzonte
+#     {"horizon_h":6, "valid_at":"...", "wind_speed":12.5, "wind_gusts":16.2,
+#      "wind_direction":215, "wind_direction_cardinal":"SW",
+#      "wave_height":0.8, "precip":0.0,
+#      "alert":false, "alert_reasons":[]},
 #     ...
+#   ],
+#   "waypoints": [
+#     {"name":"WP1 Lignano", "lat":45.689, "lon":13.132,
+#      "forecasts": [   # una entry per orizzonte
+#        {"horizon_h":0, "valid_at":"...", "wind_speed":11.2,
+#         "wind_gusts":14.0, "wind_direction":210,
+#         "wind_direction_cardinal":"SSW", "wave_height":0.6,
+#         "wave_period":4.5, "wave_direction":215, "precip":0.0,
+#         "temperature":18.5, "pressure":1015.2,
+#         "alert":false, "alert_reasons":[]},
+#        ...
+#      ]}, ...
 #   ]
 # }
 #
-# La schermata mostra:
-# 1. Card riassuntive lungo la rotta (+0/+6/+12/+24h): vento medio, raffica
-#    max, onda media, classe Beaufort colorata, badge ALERT se soglia superata.
-# 2. Tabella per waypoint con valori a +0h e +12h.
-# 3. Pulsante "Aggiorna" per ricaricare il file da blob storage.
+# La schermata mostra (analogo al sito):
+# 1. SELETTORE FILE: spinner con i file disponibili nel blob, ricaricabile.
+# 2. RIEPILOGO: una card per ogni horizon presente in summary (sfondo Beaufort,
+#    vento, dir, raffica, onda, pioggia, badge ALERT).
+# 3. DETTAGLIO PER WAYPOINT: tabella nome WP * orizzonti.
 # =============================================================================
 
 class WeatherScreen(TabScreen):
     """Schermata Meteo: previsioni precaricate da blob storage.
 
-    Layout:
-    - Header: nome modello + timestamp generazione + data partenza + pulsante Aggiorna
-    - Card +0h / +6h / +12h / +24h con vento/onda/pioggia medi sulla rotta
-    - Tabella waypoint con valori a +0h e +12h
+    Layout fedele al sito (frontend/weather.js):
+    - Header: selettore file + "Aggiorna lista" + status + meta
+    - Body scrollabile:
+        * Sezione "Riepilogo lungo la rotta" (card)
+        * Sezione "Dettaglio per waypoint" (tabella)
     """
-    # 4 orizzonti previsti nelle card (in ore dal reference_time)
-    HORIZONS = (0, 6, 12, 24)
 
-    # Soglie default per badge ALERT (sovrascritte da forecast['thresholds'])
+    # Soglie default per ALERT se non presenti in meta (verra' usato il flag
+    # 'alert' del JSON quando presente, calcolato lato server).
     DEFAULT_THR = {'wind': 22.0, 'gust': 28.0, 'wave': 2.0, 'precip': 2.0}
 
-    # Categorie Beaufort -> colore card (gradiente di sfondo)
-    # Identico al frontend (weather.js -> windClass) per coerenza grafica.
+    # ----- Mapping Beaufort -> RGBA card e righe tabella ---------------
+    # Replica del sito (style.css -> .weather-card.wind-*).
+
     @staticmethod
     def wind_class_color(kn):
-        """Tinta del background card in base al vento (kn).
-        Restituisce (r, g, b, a) RGBA float 0..1."""
+        """Colore di sfondo card in base al vento (kn). RGBA float 0..1."""
         if kn is None:
-            return (0.10, 0.13, 0.20, 1)        # grigio scuro neutro
+            return (0.10, 0.13, 0.20, 1)
         if kn < 5:    return (0.13, 0.18, 0.26, 1)   # calm
         if kn < 11:   return (0.13, 0.23, 0.18, 1)   # light
-        if kn < 17:   return (0.16, 0.25, 0.13, 1)   # mod
-        if kn < 22:   return (0.27, 0.24, 0.10, 1)   # fresh
-        if kn < 28:   return (0.32, 0.20, 0.09, 1)   # strong
-        if kn < 34:   return (0.35, 0.13, 0.10, 1)   # near gale
-        return (0.30, 0.06, 0.06, 1)                  # gale+
+        if kn < 17:   return (0.18, 0.30, 0.14, 1)   # mod
+        if kn < 22:   return (0.32, 0.28, 0.10, 1)   # fresh
+        if kn < 28:   return (0.40, 0.24, 0.10, 1)   # strong
+        if kn < 34:   return (0.45, 0.13, 0.10, 1)   # near gale
+        return (0.40, 0.06, 0.06, 1)                  # gale+
+
+    @staticmethod
+    def wind_row_color(kn):
+        """Colore riga tabella (versione attenuata)."""
+        if kn is None or kn < 22:
+            return (0.07, 0.10, 0.14, 1)
+        if kn < 28:   return (0.20, 0.15, 0.08, 1)
+        if kn < 34:   return (0.25, 0.10, 0.08, 1)
+        return (0.30, 0.08, 0.08, 1)
 
     @staticmethod
     def deg_to_cardinal(deg):
-        """Direzione in gradi (0=N) -> punto cardinale stringa breve."""
         if deg is None:
             return '--'
         dirs = ('N','NNE','NE','ENE','E','ESE','SE','SSE',
@@ -5664,392 +5730,556 @@ class WeatherScreen(TabScreen):
         idx = int(round(((deg % 360) + 360) % 360 / 22.5)) % 16
         return dirs[idx]
 
+    @staticmethod
+    def fmt_kn(v):  return '--' if v is None else f'{v:.1f} kn'
+    @staticmethod
+    def fmt_deg(v): return '--' if v is None else f'{v:.0f}°'
+    @staticmethod
+    def fmt_m(v):   return '--' if v is None else f'{v:.1f} m'
+    @staticmethod
+    def fmt_mm(v):  return '--' if v is None else f'{v:.1f} mm'
+    @staticmethod
+    def fmt_c(v):   return '--' if v is None else f'{v:.1f}°C'
+    @staticmethod
+    def fmt_hpa(v): return '--' if v is None else f'{v:.0f} hPa'
+
     def __init__(self, dm, **kw):
         super().__init__(dm, 'Meteo  Previsioni', name='weather', **kw)
-        self._forecast = None     # dict caricato dal blob (None = non caricato)
-        self._last_err = None
+        self._forecast = None     # dict caricato dal blob
+        self._files = []          # lista [(filename, last_modified)]
         self._loading = False
         self._build()
 
+    # ------------------------------------------------------------------
+    # UI -- costruzione layout
+    # ------------------------------------------------------------------
+
     def _build(self):
-        # Layout: colonna unica, scrollabile per tablet piu' piccoli.
         from kivy.uix.scrollview import ScrollView
-        outer = BoxLayout(orientation='vertical', spacing=dp(8),
+        from kivy.uix.spinner import Spinner
+        outer = BoxLayout(orientation='vertical', spacing=dp(6),
                            padding=dp(8), size_hint=(1, 1))
         self.body.add_widget(outer)
 
-        # ---- HEADER: pulsante refresh + label stato ----
-        hdr = BoxLayout(orientation='horizontal', spacing=dp(8),
-                         size_hint_y=None, height=dp(60))
-        self._refresh_btn = mk_btn('Aggiorna previsione',
-                                    self._do_refresh, sp(18))
-        hdr.add_widget(self._refresh_btn)
-        outer.add_widget(hdr)
+        # ---- HEADER riga 1: label "File:" + spinner ----
+        hdr_row1 = BoxLayout(orientation='horizontal', spacing=dp(6),
+                              size_hint_y=None, height=dp(56))
+        hdr_row1.add_widget(Label(text='File:', font_size=sp(16),
+                                    color=MUTED, size_hint_x=None,
+                                    width=dp(50),
+                                    halign='right', valign='middle'))
+        self._file_spinner = Spinner(
+            text='(premi "Aggiorna lista")', values=[],
+            font_size=sp(15), size_hint_x=1,
+            background_color=PANEL, color=WHITE,
+            background_normal='')
+        self._file_spinner.bind(text=self._on_file_chosen)
+        hdr_row1.add_widget(self._file_spinner)
+        outer.add_widget(hdr_row1)
 
+        # ---- HEADER riga 2: pulsante "Aggiorna lista" ----
+        hdr_row2 = BoxLayout(orientation='horizontal', spacing=dp(6),
+                              size_hint_y=None, height=dp(50))
+        self._refresh_list_btn = mk_btn('Aggiorna lista',
+                                          self._do_refresh_list, sp(16))
+        hdr_row2.add_widget(self._refresh_list_btn)
+        outer.add_widget(hdr_row2)
+
+        # Status + meta
         self._status_lbl = Label(
-            text='(Premi "Aggiorna previsione" per scaricare il forecast.)',
-            font_size=sp(15), color=MUTED,
-            size_hint_y=None, height=dp(40),
+            text='Premi "Aggiorna lista" per cercare i file meteo disponibili.',
+            font_size=sp(13), color=MUTED,
+            size_hint_y=None, height=dp(28),
             halign='center', valign='middle')
         self._status_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
         outer.add_widget(self._status_lbl)
 
         self._meta_lbl = Label(
-            text='', font_size=sp(13), color=MUTED,
-            size_hint_y=None, height=dp(36),
+            text='', font_size=sp(12), color=MUTED,
+            size_hint_y=None, height=dp(40),
             halign='center', valign='middle')
         self._meta_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
         outer.add_widget(self._meta_lbl)
 
         # ---- BODY scrollabile ----
         self._scroll = ScrollView(size_hint=(1, 1),
-                                    do_scroll_x=False, do_scroll_y=True)
+                                    do_scroll_x=False, do_scroll_y=True,
+                                    bar_width=dp(8))
         self._body_box = BoxLayout(orientation='vertical', spacing=dp(10),
-                                     size_hint_y=None)
+                                     size_hint_y=None, padding=[0, dp(4)])
         self._body_box.bind(minimum_height=self._body_box.setter('height'))
         self._scroll.add_widget(self._body_box)
         outer.add_widget(self._scroll)
 
-        # All'avvio: prova caricamento automatico se il file e' gia'
-        # disponibile nel cache locale (futuro). Per ora resta vuoto.
+    # ------------------------------------------------------------------
+    # Refresh lista file dal blob storage
+    # ------------------------------------------------------------------
 
-    # -------------------------------------------------------------------
-    # Refresh handler: scarica il file forecast.json dal blob.
-    # -------------------------------------------------------------------
-    def _do_refresh(self, *_):
+    def _do_refresh_list(self, *_):
+        """LIST del container meteo/{boat_id}/ e popola lo spinner."""
         if self._loading:
             return
-        url = self.dm.download_meteo_url()
-        if not url:
-            self._set_status('cloud_boat_id non configurato in sailing_config.json',
-                              RED)
+        if not self.dm.cloud_boat_id:
+            self._set_status('cloud_boat_id non configurato', RED)
             return
-        if not (self.dm.blob_account_key or '').strip():
-            self._set_status('blob_account_key non configurata.', RED)
+        has_sas = bool((getattr(self.dm, 'blob_sas_token', '') or '').strip())
+        has_key = bool((getattr(self.dm, 'blob_account_key', '') or '').strip())
+        if not (has_sas or has_key):
+            self._set_status('Ne SAS ne Account Key configurati.', RED)
             return
         self._loading = True
-        self._refresh_btn.disabled = True
-        self._set_status(f'Scaricamento da:\n{url[:80]}...', WHITE)
+        self._refresh_list_btn.disabled = True
+        self._set_status('Caricamento elenco file...', WHITE)
+
+        def _worker():
+            try:
+                files, err = self._list_meteo_files()
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f'WeatherScreen list CRASH:\n{tb}')
+                log_err(f'WeatherScreen list: {e}', exc=e)
+                files, err = [], f'{type(e).__name__}: {e}'
+
+            @mainthread
+            def _finish():
+                self._loading = False
+                self._refresh_list_btn.disabled = False
+                if err:
+                    self._set_status(f'Errore lista: {err}', ORANGE)
+                    return
+                self._files = files
+                if not files:
+                    self._set_status('Nessun file meteo trovato.', MUTED)
+                    self._file_spinner.values = []
+                    self._file_spinner.text = '(nessun file)'
+                    return
+                # Popola spinner ordinato desc (piu' recente in alto)
+                self._file_spinner.values = [fn for fn, _ in files]
+                self._file_spinner.text = files[0][0]
+                self._set_status(f'{len(files)} file disponibili. '
+                                  'Carico il piu\' recente...', GREEN)
+                self._download_and_render(files[0][0])
+            _finish()
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _list_meteo_files(self):
+        """LIST del container meteo/{boat_id}/ via Azure Blob REST API.
+        Restituisce (files, err) con files = [(filename, last_modified), ...]
+        ordinato per data desc."""
+        boat = self.dm.cloud_boat_id
+        base = (self.dm.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
+        # Pattern: GET .../meteo?restype=container&comp=list&prefix=soar/
+        url = (f'{base}/{BLOB_CONTAINER_METEO}'
+               f'?restype=container&comp=list&prefix={boat}/')
+        req = urllib.request.Request(url, method='GET')
+        try:
+            authorize_blob_request(req, self.dm)
+        except Exception as e:
+            return [], f'auth: {e}'
+        ctx = _SSL_CTX_VERIFIED or ssl.create_default_context()
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                if resp.status != 200:
+                    return [], f'HTTP {resp.status}'
+                xml = resp.read().decode('utf-8', errors='replace')
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode('utf-8', errors='replace')[:200]
+            except Exception:
+                body = ''
+            return [], f'HTTP {e.code}: {body}'
+        except Exception as e:
+            return [], f'{type(e).__name__}: {e}'
+
+        # Parse XML
+        import xml.etree.ElementTree as ET
+        files = []
+        try:
+            root = ET.fromstring(xml)
+            for blob in root.iter('Blob'):
+                name_el = blob.find('Name')
+                if name_el is None or not name_el.text:
+                    continue
+                full = name_el.text  # "soar/meteo-2026-05-13-14-30.json"
+                fname = full.split('/', 1)[-1] if '/' in full else full
+                if not fname.lower().endswith('.json'):
+                    continue
+                props = blob.find('Properties')
+                lm = ''
+                if props is not None:
+                    lm_el = props.find('Last-Modified')
+                    if lm_el is not None and lm_el.text:
+                        lm = lm_el.text
+                files.append((fname, lm))
+        except ET.ParseError as e:
+            return [], f'XML parse: {e}'
+        # Ordinamento desc: i nomi del sito sono ISO-like quindi sort
+        # lessicografico inverso = sort temporale desc. Fallback su lm.
+        files.sort(key=lambda x: (x[1] or '', x[0]), reverse=True)
+        return files, None
+
+    # ------------------------------------------------------------------
+    # Selezione file -> download e render
+    # ------------------------------------------------------------------
+
+    def _on_file_chosen(self, spinner, text):
+        if not text or text.startswith('(') or self._loading:
+            return
+        self._download_and_render(text)
+
+    def _download_and_render(self, filename):
+        if self._loading:
+            return
+        self._loading = True
+        boat = self.dm.cloud_boat_id
+        base = (self.dm.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
+        from urllib.parse import quote
+        url = (f'{base}/{BLOB_CONTAINER_METEO}/{boat}/'
+               f'{quote(filename, safe="._-")}')
+        self._set_status(f'Scarico {filename}...', WHITE)
 
         def _worker():
             try:
                 ok, data = self.dm._http_get_json(url, timeout=20)
                 if ok:
-                    Clock.schedule_once(
-                        lambda dt, d=data: self._on_loaded(d), 0)
+                    @mainthread
+                    def _ok():
+                        self._loading = False
+                        self._on_loaded(data, filename)
+                    _ok()
                 else:
-                    Clock.schedule_once(
-                        lambda dt, m=str(data): self._on_error(m), 0)
+                    @mainthread
+                    def _err():
+                        self._loading = False
+                        self._set_status(f'Errore: {data}', ORANGE)
+                    _err()
             except Exception as e:
                 import traceback
-                print(f'WeatherScreen worker CRASH:\n{traceback.format_exc()}')
-                Clock.schedule_once(
-                    lambda dt, m=f'{type(e).__name__}: {e}': self._on_error(m),
-                    0)
-            finally:
-                Clock.schedule_once(lambda dt: self._unlock_refresh(), 0)
-
+                print(f'WeatherScreen download CRASH:\n{traceback.format_exc()}')
+                log_err(f'WeatherScreen download: {e}', exc=e)
+                @mainthread
+                def _err2():
+                    self._loading = False
+                    self._set_status(f'{type(e).__name__}: {e}', RED)
+                _err2()
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _unlock_refresh(self):
-        self._loading = False
-        self._refresh_btn.disabled = False
-
-    def _on_error(self, msg):
-        self._last_err = msg
-        self._set_status(f'Errore download:\n{msg}', RED)
-        # Tieni la UI vuota / mantenuta: non azzero le card precedenti
-        # cosi' si vede ancora la previsione vecchia se c'era.
-
-    def _on_loaded(self, data):
-        """Validazione di base + render UI."""
-        if not isinstance(data, dict):
-            return self._on_error('JSON non e\' un oggetto')
-        wps = data.get('waypoints')
-        if not isinstance(wps, list) or not wps:
-            return self._on_error('forecast.json: campo "waypoints" mancante o vuoto')
-        # OK: salva e renderizza
+    def _on_loaded(self, data, filename):
+        """Forecast scaricato: salva, aggiorna meta, renderizza."""
         self._forecast = data
-        self._last_err = None
-        self._render_meta()
-        self._render_cards()
-        self._render_table()
-        n_wp = len(wps)
-        self._set_status(f'Previsione caricata: {n_wp} waypoint, '
-                          f'{len(self.HORIZONS)} orizzonti.', GREEN)
-
-    def _set_status(self, text, color):
+        self._set_status(f'OK: {filename}', GREEN)
+        # Meta
+        meta = (data or {}).get('meta', {}) or {}
+        boat_name = meta.get('boat_name', meta.get('boat_id', '?'))
+        gen = (meta.get('generated_at', '') or '')[:16].replace('T', ' ')
+        ref = (meta.get('reference_time', '') or '')[:16].replace('T', ' ')
+        src = meta.get('source', {}) or {}
+        model = src.get('model', '?')
+        n_wp = len(data.get('waypoints', []) if data else [])
+        self._meta_lbl.text = (f'{boat_name}  ·  Modello: {model}\n'
+                                f'Generato: {gen}  ·  Rif: {ref}  ·  WP: {n_wp}')
         try:
-            self._status_lbl.text = text
-            self._status_lbl.color = color
-        except Exception:
-            pass
+            self._render()
+        except Exception as e:
+            import traceback
+            print(f'WeatherScreen render CRASH:\n{traceback.format_exc()}')
+            log_err(f'WeatherScreen render: {e}', exc=e)
+            self._set_status(f'Render fallito: {e}', RED)
 
-    # -------------------------------------------------------------------
-    # Rendering
-    # -------------------------------------------------------------------
-    def _render_meta(self):
-        f = self._forecast or {}
-        gen = f.get('generated_at', '?')
-        model = f.get('model', '?')
-        ref = f.get('reference_time', '')
-        # Mostro orario generazione in formato leggibile (gg/mm hh:mm)
-        gen_disp = gen
-        try:
-            # Parsing ISO 8601 senza external libs
-            from datetime import datetime
-            dt = datetime.fromisoformat(gen.replace('Z', '+00:00'))
-            gen_disp = dt.strftime('%d/%m %H:%M')
-        except Exception:
-            pass
-        line = f'Modello: {model}    Generato: {gen_disp}'
-        if ref:
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(ref.replace('Z', '+00:00'))
-                line += f'    Partenza: {dt.strftime("%d/%m %H:%M")}'
-            except Exception:
-                line += f'    Partenza: {ref}'
-        self._meta_lbl.text = line
+    def _set_status(self, msg, color):
+        self._status_lbl.text = msg
+        self._status_lbl.color = color
 
-    def _render_cards(self):
-        """Crea 4 card (+0/+6/+12/+24h) con valori medi lungo la rotta."""
-        # Sezione titolo
+    # ------------------------------------------------------------------
+    # Rendering principale: card + tabella
+    # ------------------------------------------------------------------
+
+    def _render(self):
+        """Riempie self._body_box con sezione summary + tabella waypoint."""
         self._body_box.clear_widgets()
-        title = Label(text='Riepilogo lungo la rotta',
-                        font_size=sp(18), color=ACCENT, bold=True,
-                        size_hint_y=None, height=dp(34),
-                        halign='left', valign='middle')
-        title.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        self._body_box.add_widget(title)
+        if not self._forecast:
+            return
+        # Sezione 1: card riepilogo lungo la rotta (usa 'summary' del JSON)
+        self._render_summary_cards()
+        # Sezione 2: tabella dettaglio per waypoint
+        self._render_waypoint_table()
 
-        # Card row: 4 card affiancate (responsive: il tablet e' largo)
-        cards = BoxLayout(orientation='horizontal', spacing=dp(8),
-                           size_hint_y=None, height=dp(170))
-        thr = (self._forecast.get('thresholds') or self.DEFAULT_THR)
-        for h in self.HORIZONS:
-            agg = self._aggregate_horizon(h)
-            cards.add_widget(self._make_card(h, agg, thr))
-        self._body_box.add_widget(cards)
+    # ----- Sezione 1: card riepilogo -----
 
-    def _aggregate_horizon(self, hours):
-        """Aggrega vento/onda/pioggia su tutti i waypoint per un orizzonte.
-        Usa media vettoriale per la direzione (sin/cos) per evitare wraparound."""
-        wps = self._forecast.get('waypoints') or []
-        speeds, gusts, waves, precs, dirs_sin, dirs_cos = [], [], [], [], [], []
-        n_dir = 0
-        for wp in wps:
-            hh = (wp.get('horizons') or {}).get(str(hours))
-            if not hh:
-                continue
-            ws = hh.get('wind_speed')
-            wg = hh.get('wind_gusts')
-            wd = hh.get('wind_direction')
-            wave = hh.get('wave_height')
-            pr = hh.get('precipitation')
-            if ws is not None: speeds.append(ws)
-            if wg is not None: gusts.append(wg)
-            if wave is not None: waves.append(wave)
-            if pr is not None: precs.append(pr)
-            if wd is not None:
-                rad = math.radians(wd)
-                dirs_sin.append(math.sin(rad))
-                dirs_cos.append(math.cos(rad))
-                n_dir += 1
-        out = {
-            'wind_speed':    (sum(speeds) / len(speeds)) if speeds else None,
-            'wind_gusts':    max(gusts) if gusts else None,   # max raffica, non media
-            'wave_height':   (sum(waves) / len(waves)) if waves else None,
-            'precipitation': (sum(precs) / len(precs)) if precs else None,
-            'wind_direction': None,
-        }
-        if n_dir:
-            ds = sum(dirs_sin) / n_dir
-            dc = sum(dirs_cos) / n_dir
-            out['wind_direction'] = (math.degrees(math.atan2(ds, dc)) + 360) % 360
-        return out
-
-    def _make_card(self, hours, agg, thr):
-        """Crea il widget visuale per UNA card orizzonte.
-        Layout verticale: titolo orizzonte / vento + freccia / raffica / onda+pioggia."""
-        # Sfondo colorato in base alla classe vento
-        from kivy.graphics import Color, RoundedRectangle
-        ws = agg.get('wind_speed')
-        bg = self.wind_class_color(ws)
-        # Alert: una qualsiasi soglia superata?
-        alert = self._check_alert(agg, thr)
-
-        card = BoxLayout(orientation='vertical', spacing=dp(2),
-                          padding=dp(8), size_hint_y=None, height=dp(170))
-        with card.canvas.before:
-            Color(*bg)
-            card._bg_rect = RoundedRectangle(pos=card.pos, size=card.size,
-                                              radius=[dp(6)])
-            # Bordo: rosso se alert, sottile altrimenti
-            if alert:
-                Color(0.85, 0.20, 0.15, 1)
-            else:
-                Color(0.30, 0.40, 0.55, 0.5)
-            card._bg_border = RoundedRectangle(
-                pos=card.pos, size=card.size, radius=[dp(6)])
-        # Aggiorna il rettangolo quando il widget si riposiziona
-        def _upd_rect(w, *_):
-            try:
-                card._bg_rect.pos = w.pos; card._bg_rect.size = w.size
-                card._bg_border.pos = w.pos; card._bg_border.size = w.size
-            except Exception: pass
-        card.bind(pos=_upd_rect, size=_upd_rect)
-
-        # Header riga: orizzonte + badge ALERT se serve
-        h_row = BoxLayout(orientation='horizontal',
-                           size_hint_y=None, height=dp(22))
-        hrz_lbl = Label(text=f'+{hours}h', font_size=sp(15), bold=True,
-                         color=ACCENT, halign='left', valign='middle')
-        hrz_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        h_row.add_widget(hrz_lbl)
-        if alert:
-            al = Label(text='[ALERT]', font_size=sp(13), bold=True,
-                        color=RED, halign='right', valign='middle')
-            al.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-            h_row.add_widget(al)
-        card.add_widget(h_row)
-
-        # Vento principale (grande): "12 kn  W"
-        if ws is not None:
-            wd_str = self.deg_to_cardinal(agg.get('wind_direction'))
-            txt = f'{ws:.0f} kn  {wd_str}'
-        else:
-            txt = '-- kn'
-        wind_lbl = Label(text=txt, font_size=sp(28), bold=True, color=WHITE,
-                          size_hint_y=None, height=dp(40),
-                          halign='center', valign='middle')
-        wind_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        card.add_widget(wind_lbl)
-
-        # Raffica
-        wg = agg.get('wind_gusts')
-        gust_txt = f'Raffica max: {wg:.0f} kn' if wg is not None else 'Raffica: --'
-        gust_color = RED if (wg and wg >= thr.get('gust', 28)) else MUTED
-        gust_lbl = Label(text=gust_txt, font_size=sp(13), color=gust_color,
-                          size_hint_y=None, height=dp(20),
-                          halign='center', valign='middle')
-        gust_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        card.add_widget(gust_lbl)
-
-        # Onda + pioggia
-        wave = agg.get('wave_height')
-        prec = agg.get('precipitation')
-        wave_str = f'{wave:.1f}m' if wave is not None else '--'
-        prec_str = f'{prec:.1f}mm/h' if prec is not None else '--'
-        oc_color = WHITE
-        if (wave and wave >= thr.get('wave', 2.0)) or \
-           (prec and prec >= thr.get('precip', 2.0)):
-            oc_color = ORANGE
-        oc_lbl = Label(text=f'Onda: {wave_str}    Pioggia: {prec_str}',
-                        font_size=sp(13), color=oc_color,
-                        size_hint_y=None, height=dp(20),
-                        halign='center', valign='middle')
-        oc_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        card.add_widget(oc_lbl)
-        return card
-
-    def _check_alert(self, agg, thr):
-        """True se almeno UNA metrica supera la soglia corrispondente."""
-        ws = agg.get('wind_speed')
-        wg = agg.get('wind_gusts')
-        wave = agg.get('wave_height')
-        prec = agg.get('precipitation')
-        if ws is not None and ws >= thr.get('wind', 22.0):    return True
-        if wg is not None and wg >= thr.get('gust', 28.0):    return True
-        if wave is not None and wave >= thr.get('wave', 2.0): return True
-        if prec is not None and prec >= thr.get('precip', 2.0): return True
-        return False
-
-    def _render_table(self):
-        """Tabella con dettaglio per waypoint a +0h e +12h.
-        Colonne: Waypoint | +0h: vento (kn) dir / raffica / onda
-                          | +12h: vento (kn) dir / raffica / onda"""
-        # Sezione titolo
-        title = Label(text='Dettaglio per waypoint (+0h / +12h)',
-                        font_size=sp(18), color=ACCENT, bold=True,
-                        size_hint_y=None, height=dp(34),
-                        halign='left', valign='middle')
-        title.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        self._body_box.add_widget(title)
-
+    def _render_summary_cards(self):
+        """Renderizza una card per ogni entry del summary."""
+        summary = (self._forecast or {}).get('summary', []) or []
+        if not summary:
+            self._body_box.add_widget(Label(
+                text='Nessun riepilogo presente nel file meteo.',
+                font_size=sp(14), color=MUTED,
+                size_hint_y=None, height=dp(40)))
+            return
+        # Titolo sezione
+        self._body_box.add_widget(Label(
+            text='Riepilogo lungo la rotta', font_size=sp(18),
+            color=ACCENT, bold=True, size_hint_y=None, height=dp(32),
+            halign='left', valign='middle'))
+        # Grid con N colonne (una per orizzonte)
+        n = len(summary)
+        # Su tablet ci stanno 4-5 card affiancate; se piu', si va a capo.
+        # GridLayout calcola da solo le righe necessarie.
         from kivy.uix.gridlayout import GridLayout
-        thr = (self._forecast.get('thresholds') or self.DEFAULT_THR)
-        wps = self._forecast.get('waypoints') or []
-        # Header + righe = (1 + len(wps))
-        n_rows = 1 + len(wps)
-        grid = GridLayout(cols=4, size_hint_y=None,
-                           row_default_height=dp(32),
-                           row_force_default=True,
-                           spacing=(dp(2), dp(2)))
-        grid.height = dp(32) * n_rows + dp(2) * (n_rows - 1)
-
-        def _hdr(text):
-            l = Label(text=text, font_size=sp(13), bold=True, color=ACCENT,
-                       halign='center', valign='middle')
-            l.bind(size=lambda lab, _: setattr(lab, 'text_size', lab.size))
-            return l
-
-        def _cell(text, color=WHITE):
-            l = Label(text=text, font_size=sp(13), color=color,
-                       halign='center', valign='middle')
-            l.bind(size=lambda lab, _: setattr(lab, 'text_size', lab.size))
-            return l
-
-        grid.add_widget(_hdr('Waypoint'))
-        grid.add_widget(_hdr('+0h vento/raff.'))
-        grid.add_widget(_hdr('+12h vento/raff.'))
-        grid.add_widget(_hdr('Onda max'))
-
-        for wp in wps:
-            name = wp.get('name', '?')
-            hh = wp.get('horizons') or {}
-            h0 = hh.get('0') or {}
-            h12 = hh.get('12') or {}
-            # +0h cell
-            ws0 = h0.get('wind_speed'); wg0 = h0.get('wind_gusts')
-            wd0 = h0.get('wind_direction')
-            txt0 = '--'
-            if ws0 is not None:
-                txt0 = f'{ws0:.0f}/{wg0:.0f} kn' if wg0 is not None else f'{ws0:.0f} kn'
-                txt0 += f' {self.deg_to_cardinal(wd0)}'
-            color0 = RED if (ws0 and ws0 >= thr.get('wind', 22.0)) else WHITE
-            # +12h cell
-            ws12 = h12.get('wind_speed'); wg12 = h12.get('wind_gusts')
-            wd12 = h12.get('wind_direction')
-            txt12 = '--'
-            if ws12 is not None:
-                txt12 = (f'{ws12:.0f}/{wg12:.0f} kn'
-                         if wg12 is not None else f'{ws12:.0f} kn')
-                txt12 += f' {self.deg_to_cardinal(wd12)}'
-            color12 = RED if (ws12 and ws12 >= thr.get('wind', 22.0)) else WHITE
-            # Onda max tra h0 e h12
-            wave_max = None
-            for hd in (h0, h12):
-                w = hd.get('wave_height')
-                if w is not None:
-                    wave_max = w if wave_max is None else max(wave_max, w)
-            wave_txt = f'{wave_max:.1f}m' if wave_max is not None else '--'
-            wave_color = (RED if (wave_max and wave_max >= thr.get('wave', 2.0))
-                          else WHITE)
-
-            grid.add_widget(_cell(name))
-            grid.add_widget(_cell(txt0, color0))
-            grid.add_widget(_cell(txt12, color12))
-            grid.add_widget(_cell(wave_txt, wave_color))
-
+        # Card alte ~ dp(220) per starci tutto comodamente
+        card_h = dp(220)
+        # Calcolo colonne adattive: min 2, max 5
+        cols = max(2, min(5, n))
+        rows = (n + cols - 1) // cols
+        grid = GridLayout(cols=cols, spacing=dp(8),
+                           size_hint_y=None,
+                           height=card_h * rows + dp(8) * (rows - 1) if rows > 0 else dp(0))
+        for s in summary:
+            grid.add_widget(self._build_summary_card(s))
         self._body_box.add_widget(grid)
 
+    def _build_summary_card(self, s):
+        """Costruisce una singola card meteo per UN orizzonte (dict summary).
+
+        Layout della card (replica .weather-card del sito):
+        +-------------------+
+        | +6h               |  <- orizzonte (arancione, grande)
+        | mar 18:30         |  <- valid_at formattato
+        |                   |
+        |        ↓ (rot.)   |  <- freccia direzione vento
+        |    12.5 kn        |  <- velocita' vento (grande)
+        |    SW 215°        |  <- cardinale + gradi
+        |  raff. max 16.2   |
+        |  🌊 0.8 m         |
+        |  ☔ 0.0 mm        |
+        |  ⚠ ALERT          |  <- badge solo se alert=true
+        +-------------------+
+        """
+        hoff = s.get('horizon_h', 0)
+        valid_at = s.get('valid_at', '')
+        ws = s.get('wind_speed')
+        wg = s.get('wind_gusts')
+        wd = s.get('wind_direction')
+        wdc = s.get('wind_direction_cardinal') or self.deg_to_cardinal(wd)
+        wh = s.get('wave_height')
+        pp = s.get('precip')
+        alert = bool(s.get('alert', False))
+
+        # BoxLayout verticale con sfondo colorato Beaufort
+        card = BoxLayout(orientation='vertical', spacing=dp(2),
+                          padding=dp(10), size_hint_y=None, height=dp(220))
+        bg_col = self.wind_class_color(ws)
+        if alert:
+            # Tinta piu' rossa se alert
+            bg_col = (0.45, 0.10, 0.10, 1)
+        _bg(card, bg_col)
+
+        # Riga 1: orizzonte (es. "+6h")
+        card.add_widget(Label(
+            text=f'+{hoff}h',
+            font_size=sp(22), bold=True, color=ACCENT,
+            size_hint_y=None, height=dp(28),
+            halign='left', valign='middle'))
+        # Riga 2: valid_at formattato (es. "mar 18:30")
+        card.add_widget(Label(
+            text=self._format_valid_at(valid_at),
+            font_size=sp(11), color=MUTED,
+            size_hint_y=None, height=dp(18),
+            halign='left', valign='middle'))
+        # Riga 3: freccia direzione (rotata con simbolo unicode)
+        # Per semplicita' uso un emoji direzionale + cardinale.
+        # Kivy non ruota facilmente un Label senza canvas custom.
+        # Usiamo una freccia base e mostriamo il cardinale di fianco.
+        arrow = self._wind_arrow_char(wd)
+        card.add_widget(Label(
+            text=arrow,
+            font_size=sp(36), bold=True, color=ACCENT,
+            size_hint_y=None, height=dp(46),
+            halign='center', valign='middle'))
+        # Riga 4: velocita' vento grande
+        card.add_widget(Label(
+            text=self.fmt_kn(ws),
+            font_size=sp(22), bold=True, color=WHITE,
+            size_hint_y=None, height=dp(30),
+            halign='center', valign='middle'))
+        # Riga 5: dir cardinale + gradi
+        card.add_widget(Label(
+            text=f'{wdc}  {self.fmt_deg(wd)}' if wd is not None else '--',
+            font_size=sp(13), color=MUTED,
+            size_hint_y=None, height=dp(20),
+            halign='center', valign='middle'))
+        # Riga 6: raffica max
+        if wg is not None:
+            card.add_widget(Label(
+                text=f'raff. max {self.fmt_kn(wg)}',
+                font_size=sp(11), color=MUTED,
+                size_hint_y=None, height=dp(18),
+                halign='center', valign='middle'))
+        # Riga 7: onda
+        if wh is not None:
+            card.add_widget(Label(
+                text=f'Onda {self.fmt_m(wh)}',
+                font_size=sp(13), color=WHITE,
+                size_hint_y=None, height=dp(20),
+                halign='center', valign='middle'))
+        # Riga 8: pioggia (solo se > 0.05mm come fa il sito)
+        if pp is not None and pp > 0.05:
+            card.add_widget(Label(
+                text=f'Pioggia {self.fmt_mm(pp)}',
+                font_size=sp(13), color=WHITE,
+                size_hint_y=None, height=dp(20),
+                halign='center', valign='middle'))
+        # Riga 9: badge ALERT
+        if alert:
+            reasons = ', '.join(s.get('alert_reasons') or []) or 'soglie'
+            card.add_widget(Label(
+                text=f'ALERT: {reasons}',
+                font_size=sp(11), bold=True, color=(1, 0.85, 0.6, 1),
+                size_hint_y=None, height=dp(20),
+                halign='center', valign='middle'))
+        return card
+
+    def _format_valid_at(self, iso_str):
+        """ISO timestamp -> 'gio 12:30' italiano."""
+        if not iso_str:
+            return ''
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+            # Giorno settimana abbreviato italiano
+            wd = ('lun', 'mar', 'mer', 'gio', 'ven', 'sab', 'dom')[dt.weekday()]
+            return f'{wd} {dt.strftime("%H:%M")}'
+        except Exception:
+            return iso_str[:16].replace('T', ' ')
+
+    def _wind_arrow_char(self, deg):
+        """Restituisce un carattere freccia approssimato per direzione vento.
+        La direzione del JSON e' la "wind_direction" meteorologica (da dove
+        viene il vento). Per visualizzare la "punta della freccia" che
+        indica dove il vento *va*, ruoto di 180.
+        Approssimo a 8 punti cardinali con ↓↙←↖↑↗→↘.
+        """
+        if deg is None:
+            return '·'
+        # Aggiungo 180 per ottenere la "freccia che indica DOVE va il vento"
+        d = (deg + 180) % 360
+        # 8 settori da 45deg ciascuno, centrati su 0,45,90,...
+        idx = int(round(d / 45.0)) % 8
+        # 0=N(↑), 1=NE(↗), 2=E(→), 3=SE(↘), 4=S(↓), 5=SW(↙), 6=W(←), 7=NW(↖)
+        arrows = ('↑', '↗', '→', '↘', '↓', '↙', '←', '↖')
+        return arrows[idx]
+
+    # ----- Sezione 2: tabella dettaglio per waypoint -----
+
+    def _render_waypoint_table(self):
+        """Tabella: una sezione per ogni waypoint con header + righe orizzonti.
+
+        Layout (per ogni waypoint):
+        +-----------------------------------------------+
+        | WP1 Lignano  (45.689, 13.132)                 |  <- header WP
+        +------+--------+--------+--------+--------+----+
+        |  +h  | Vento  | Dir    | Raff   | Onda   | mm |
+        +------+--------+--------+--------+--------+----+
+        |  0h  | 11.2kn | SSW210 | 14.0   | 0.6m   | -- |
+        |  6h  | ...                                    |
+        | 12h  | ...                                    |
+        | 24h  | ...                                    |
+        | 48h  | ...                                    |
+        +------+--------+--------+--------+--------+----+
+        Le righe con alert hanno sfondo rossastro.
+        """
+        wps = (self._forecast or {}).get('waypoints', []) or []
+        if not wps:
+            return
+        # Titolo sezione
+        self._body_box.add_widget(Label(
+            text='Dettaglio per waypoint', font_size=sp(18),
+            color=ACCENT, bold=True, size_hint_y=None, height=dp(36),
+            halign='left', valign='middle'))
+        for wp in wps:
+            self._render_waypoint_block(wp)
+
+    def _render_waypoint_block(self, wp):
+        """Blocco per UN waypoint: header + tabella orizzonti."""
+        from kivy.uix.gridlayout import GridLayout
+        name = wp.get('name', '?')
+        lat = wp.get('lat')
+        lon = wp.get('lon')
+        forecasts = wp.get('forecasts', []) or []
+
+        # Header WP
+        coord_str = ''
+        if lat is not None and lon is not None:
+            coord_str = f'  ({lat:.3f}, {lon:.3f})'
+        hdr = Label(
+            text=f'{name}{coord_str}',
+            font_size=sp(15), bold=True, color=WHITE,
+            size_hint_y=None, height=dp(34),
+            halign='left', valign='middle',
+            padding=(dp(8), 0))
+        hdr.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
+        _bg(hdr, PANEL)
+        self._body_box.add_widget(hdr)
+
+        # Tabella: 7 colonne (h, Vento, Dir, Raff, Onda, Temp, mm)
+        # Calcolo altezza: header(dp(28)) + n righe(dp(28) ciascuna)
+        cols = 7
+        header_labels = ['+h', 'Vento', 'Dir', 'Raff', 'Onda', 'Temp', 'mm']
+        n_rows = len(forecasts) + 1  # +1 per l'header
+        grid = GridLayout(cols=cols, spacing=dp(1),
+                           size_hint_y=None,
+                           height=dp(30) * n_rows + dp(1) * (n_rows - 1))
+        # Riga header tabella
+        for h in header_labels:
+            cell = Label(text=h, font_size=sp(12),
+                          color=MUTED, bold=True,
+                          size_hint_y=None, height=dp(30),
+                          halign='center', valign='middle')
+            cell.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
+            _bg(cell, (0.12, 0.15, 0.20, 1))
+            grid.add_widget(cell)
+        # Righe dati: una per orizzonte
+        for f in forecasts:
+            hoff = f.get('horizon_h', '?')
+            ws = f.get('wind_speed')
+            wd = f.get('wind_direction')
+            wdc = f.get('wind_direction_cardinal') or self.deg_to_cardinal(wd)
+            wg = f.get('wind_gusts')
+            wh = f.get('wave_height')
+            tp = f.get('temperature')
+            pp = f.get('precip')
+            alert = bool(f.get('alert', False))
+            # Colore riga in base al vento + alert
+            if alert:
+                row_bg = (0.30, 0.08, 0.08, 1)
+            else:
+                row_bg = self.wind_row_color(ws)
+            cells_text = [
+                f'+{hoff}h',
+                self.fmt_kn(ws),
+                f'{wdc} {self.fmt_deg(wd)}' if wd is not None else '--',
+                self.fmt_kn(wg),
+                self.fmt_m(wh),
+                self.fmt_c(tp),
+                self.fmt_mm(pp),
+            ]
+            for txt in cells_text:
+                cell = Label(text=txt, font_size=sp(12), color=WHITE,
+                              size_hint_y=None, height=dp(30),
+                              halign='center', valign='middle')
+                cell.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
+                _bg(cell, row_bg)
+                grid.add_widget(cell)
+        self._body_box.add_widget(grid)
+
+        # Spacer prima del prossimo WP
+        self._body_box.add_widget(Widget(size_hint_y=None, height=dp(8)))
+
+    # ------------------------------------------------------------------
+    # Tick: no-op (refresh manuale via pulsante)
+    # ------------------------------------------------------------------
     def tick(self, dt):
-        # La WeatherScreen non ha aggiornamenti realtime; refresh manuale via
-        # pulsante "Aggiorna previsione". Tick e' no-op qui.
         pass
-
-
 
 # =============================================================================
 # 8 -- IMPOSTAZIONI
@@ -6444,7 +6674,7 @@ class SailingTabletApp(App):
         self.dm=DataManager()
         self.sm=ScreenManager(transition=FadeTransition(duration=0.10))
         for cls in (NavigationScreen,StartLineScreen,LayLineScreen,
-                    WaypointsScreen,PolarScreen,LoggingScreen,WeatherScreen,
+                    WaypointsScreen,PolarScreen,WeatherScreen,LoggingScreen,
                     SettingsScreen):
             self.sm.add_widget(cls(self.dm))
         self.sidebar=Sidebar(self.sm)
