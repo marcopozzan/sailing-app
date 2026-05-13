@@ -289,7 +289,6 @@ BLOB_CONTAINER_POLARS   = 'polars'
 BLOB_CONTAINER_WAYPOINTS = 'waypoints'
 BLOB_CONTAINER_METEO    = 'meteo'
 BLOB_CONTAINER_TRACKS   = 'tracks'  # log CSV regata, uploadato come file unico
-BLOB_CONTAINER_TRACKSLIVE = 'trackslive'  # snapshot JSON live, 1 file per ciclo
 BLOB_CONTAINER_CONFIG   = 'config'   # config remoto, fallback al primo avvio
 BLOB_CONTAINER_LOGS     = 'logs'     # log errori uploadati on-demand
 BOAT_ID_DEFAULT         = 'soar'
@@ -485,10 +484,13 @@ def authorize_blob_request_sas_only(req, dm):
     """Variante di authorize_blob_request() che usa ESCLUSIVAMENTE il SAS
     token, senza fallback alla Account Key.
 
-    Usata per le operazioni sulle TRACCE (upload tracks CSV + upload
-    trackslive JSON live): per esplicita scelta dell'utente, queste
-    devono fallire in modo visibile se il SAS non e' presente o
-    invalido, invece di degradare silenziosamente alla chiave master.
+    Usata per l'upload dei file CSV delle tracce (container 'tracks'):
+    per esplicita scelta dell'utente, queste operazioni devono fallire in
+    modo visibile se il SAS non e' presente o invalido, invece di degradare
+    silenziosamente alla chiave master.
+
+    NB v1.22+: il flusso live (real-time snapshot) NON usa piu' il blob
+    storage. Va direttamente su Azure Event Hubs (CloudUploader).
 
     Solleva ValueError se blob_sas_token e' vuoto.
 
@@ -503,6 +505,144 @@ def authorize_blob_request_sas_only(req, dm):
     sep = '&' if ('?' in url) else '?'
     req.full_url = f'{url}{sep}{sas}'
     return req
+
+
+# =============================================================================
+# AZURE EVENT HUBS -- live tracking real-time (v1.21+)
+# =============================================================================
+# Architettura live:
+#   Tablet -> POST JSON HTTPS -> Event Hubs -> Fabric Eventstream -> dashboard
+#
+# Sostituisce il vecchio flusso che faceva PUT al blob 'trackslive' (un file
+# per snapshot). Event Hubs e' progettato per streaming real-time, con
+# ingestion ottimizzata e integrazione nativa con Fabric.
+#
+# Connection string Azure: e' la stringa che si copia dal portale Azure ->
+# Event Hubs Namespace -> Shared Access Policies -> nome policy -> primary
+# connection string. Formato:
+#   Endpoint=sb://<namespace>.servicebus.windows.net/;
+#   SharedAccessKeyName=<policy_name>;
+#   SharedAccessKey=<base64_key>;
+#   EntityPath=<hub_name>
+#
+# La policy deve avere almeno il permesso 'Send' (non serve 'Listen' per il
+# tablet). EntityPath = nome dell'hub specifico, opzionale (se manca nella
+# connection string, va passato a parte; qui assumiamo sia incluso).
+
+def parse_eventhub_connection_string(conn_str):
+    """Estrae dalla connection string i 4 campi necessari per generare il SAS.
+
+    Args:
+        conn_str: Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=...;
+                  EntityPath=...
+
+    Returns:
+        dict con chiavi: endpoint, key_name, key, entity_path
+
+    Solleva ValueError se la stringa e' malformata o manca un campo.
+
+    Tollerante a:
+    - spazi extra attorno ai '='
+    - ordine dei campi diverso
+    - ';' finale opzionale
+    - case-insensitive sui nomi dei campi
+    """
+    if not conn_str or not isinstance(conn_str, str):
+        raise ValueError('Connection string vuota')
+    parts = {}
+    for chunk in conn_str.split(';'):
+        chunk = chunk.strip()
+        if not chunk or '=' not in chunk:
+            continue
+        k, _, v = chunk.partition('=')
+        parts[k.strip().lower()] = v.strip()
+    endpoint    = parts.get('endpoint', '')
+    key_name    = parts.get('sharedaccesskeyname', '')
+    key         = parts.get('sharedaccesskey', '')
+    entity_path = parts.get('entitypath', '')
+    # Normalizza endpoint: deve essere 'sb://host.servicebus.windows.net/'
+    # senza schema 'amqps://' o trailing path
+    if endpoint.startswith('amqps://'):
+        endpoint = 'sb://' + endpoint[len('amqps://'):]
+    if not endpoint.endswith('/'):
+        endpoint += '/'
+    if not endpoint or not key_name or not key:
+        raise ValueError(
+            'Connection string incompleta: '
+            'Endpoint/SharedAccessKeyName/SharedAccessKey richiesti')
+    return {
+        'endpoint':    endpoint,
+        'key_name':    key_name,
+        'key':         key,
+        'entity_path': entity_path,
+    }
+
+
+def eventhub_sas_token(endpoint, key_name, key, entity_path, ttl_seconds=3600):
+    """Genera un SAS token HTTPS per Event Hubs.
+
+    Formato output (header Authorization):
+        SharedAccessSignature sr=<encoded_uri>&sig=<sig>&se=<expiry>&skn=<key_name>
+
+    L'URI da firmare e' (senza trailing slash, lowercased, urlencoded):
+        sb://<namespace>.servicebus.windows.net/<entity_path>
+
+    La firma e' HMAC-SHA256(URI + "\n" + expiry, key) -> base64 -> urlencode.
+
+    Riferimento: Azure docs "Authorizing access to Event Hubs resources using
+    Shared Access Signatures" (HTTPS REST).
+
+    Args:
+        endpoint:    'sb://<namespace>.servicebus.windows.net/'
+        key_name:    nome della Shared Access Policy
+        key:         chiave base64 della policy
+        entity_path: nome dell'hub (es. 'soar-track-live')
+        ttl_seconds: validita' del token in secondi (default 1 ora)
+
+    Returns:
+        (token_str, expiry_unix_timestamp)
+        token_str e' il valore completo dell'header Authorization.
+    """
+    import hmac as _hmac
+    import hashlib as _hashlib
+    import base64 as _b64
+    import time as _time
+    from urllib.parse import quote as _quote
+
+    # Costruisci l'URI della risorsa
+    uri = endpoint.rstrip('/')
+    if entity_path:
+        uri = f'{uri}/{entity_path}'
+    # URL-encode dell'URI per la firma e per il parametro sr
+    encoded_uri = _quote(uri, safe='')
+    expiry = int(_time.time() + max(60, int(ttl_seconds)))
+    string_to_sign = f'{encoded_uri}\n{expiry}'.encode('utf-8')
+    signed = _hmac.new(key.encode('utf-8'), string_to_sign,
+                        _hashlib.sha256).digest()
+    sig = _quote(_b64.b64encode(signed).decode('utf-8'), safe='')
+    token = (f'SharedAccessSignature sr={encoded_uri}&sig={sig}'
+             f'&se={expiry}&skn={_quote(key_name, safe="")}')
+    return token, expiry
+
+
+def eventhub_https_url(endpoint, entity_path):
+    """Costruisce l'URL HTTPS per POSTare messaggi a un Event Hub.
+
+    Formato:
+        https://<namespace>.servicebus.windows.net/<hub>/messages?api-version=2014-01
+
+    L'endpoint Azure e' 'sb://<namespace>...' che convertiamo in 'https://...'
+    """
+    if not endpoint:
+        raise ValueError('endpoint vuoto')
+    if not entity_path:
+        raise ValueError('entity_path vuoto (EntityPath manca nella connection string)')
+    # sb://name.servicebus.windows.net/ -> https://name.servicebus.windows.net/
+    host = endpoint
+    if host.startswith('sb://'):
+        host = 'https://' + host[len('sb://'):]
+    host = host.rstrip('/')
+    return f'{host}/{entity_path}/messages?api-version=2014-01'
 
 
 def get_data_dir():
@@ -1104,10 +1244,21 @@ def default_config():
         'cloud_boat_id':      BOAT_ID_DEFAULT,
         # Intervallo upload in secondi. Valori UI ammessi: 30,60,120,300,600.
         'cloud_interval_s':   60,
-        # URL della Function ingest (HTTPS POST endpoint)
-        'cloud_api_url':      'https://sailing-ingest.azurewebsites.net/api/track',
-        # Function Key per autenticarsi alla Function
-        'cloud_api_key':      '',
+        # ===== Azure Event Hubs (live tracking real-time) =====
+        # Connection string copiata dal portale Azure ->
+        #   Event Hubs Namespace -> nome hub -> Shared Access Policies ->
+        #   nome policy (permesso Send) -> Primary connection string.
+        # Formato atteso:
+        #   Endpoint=sb://<namespace>.servicebus.windows.net/;
+        #   SharedAccessKeyName=<policy>;
+        #   SharedAccessKey=<base64key>;
+        #   EntityPath=<nome_hub>
+        # Se EntityPath manca dalla connection string (es. policy a livello
+        # namespace), va aggiunto manualmente in coda. Senza EntityPath
+        # l'upload fallisce con errore chiaro.
+        # Il flusso live: CloudUploader -> POST HTTPS a Event Hubs ->
+        # Fabric Eventstream -> dashboard real-time.
+        'eventhub_connection_string': '',
         # === Azure Blob Storage ===
         # Due autenticazioni alternative supportate:
         # A) SAS token (preferita: piu' sicura, scade, permessi limitati)
@@ -1126,9 +1277,10 @@ def default_config():
         #   {blob_base}/waypoints/{cloud_boat_id}/waypoints.json (download GET)
         #   {blob_base}/meteo/{cloud_boat_id}/meteo.json       (download GET)
         #   {blob_base}/tracks/{cloud_boat_id}/{filename}.csv (upload PUT)
-        #   {blob_base}/trackslive/{cloud_boat_id}/{ts}.json   (upload PUT live)
         #   {blob_base}/config/{cloud_boat_id}/sailing_config.json (download GET)
         #   {blob_base}/logs/{cloud_boat_id}/errors_*.log     (upload PUT log)
+        # NB: il flusso live (snapshot real-time) NON usa piu' il blob storage
+        # dal v1.21+: ora va su Azure Event Hubs (eventhub_connection_string).
         'blob_base':          BLOB_BASE_DEFAULT,
         'blob_sas_token':     ('sv=2025-11-05&ss=bfqt&srt=sco&sp=rwdlacupyx'
                                '&se=2035-05-13T07:57:51Z&st=2026-05-12T23:42:51Z'
@@ -1561,31 +1713,39 @@ class PolarData:
             json.dump(payload, f, indent=2, ensure_ascii=False)
 
 # =============================================================================
-# CLOUD UPLOADER -- invio dati barca a endpoint REST
+# CLOUD UPLOADER -- live tracking via Azure Event Hubs (v1.22+)
 # =============================================================================
 
 class CloudUploader:
-    """Invia periodicamente snapshot dei dati barca al Blob Storage Azure
-    (container 'trackslive'). Ogni snapshot e' UN file JSON separato.
+    """Invia periodicamente snapshot dei dati barca ad Azure Event Hubs,
+    che a sua volta alimenta una Fabric Eventstream per la dashboard
+    real-time della regata.
 
-    URL pattern:
-        {blob_base}/trackslive/{cloud_boat_id}/{timestamp}.json
-    Esempio:
-        https://sailingapp.blob.core.windows.net/trackslive/soar/
-        2026-05-13T14-23-05Z.json
+    Endpoint:
+        POST https://<ns>.servicebus.windows.net/<hub>/messages?api-version=2014-01
+
+    Header:
+        Authorization: SharedAccessSignature sr=<uri>&sig=<hmac>&se=<exp>&skn=<key_name>
+        Content-Type:  application/json
+
+    Body: il JSON dello snapshot (vedi _build_snapshot).
 
     Caratteristiche:
     - Thread separato: non blocca mai la UI o il parsing NMEA.
-    - Buffer offline su file (.jsonl): garantisce zero perdita dati se
-      la rete cellulare e' assente o instabile. Quando la rete torna,
-      ogni record nella coda diventa un file separato nel blob.
+    - Buffer offline su file (.jsonl): zero perdita dati se la rete cellulare
+      e' assente. Quando la rete torna, drena la coda inviando ogni record
+      come evento separato.
     - Force-cellular su Android: bypassa il WiFi senza uplink (caso tipico
       del WiFi di bordo isolato) e usa la SIM dati per HTTPS.
     - Rate limit lato client: max 1 invio "manuale" ogni 60s.
+    - SAS token rigenerato automaticamente quando vicino alla scadenza
+      (TTL 1h, refresh quando mancano <300s).
 
-    Cambio architetturale v1.19:
-    - Prima: POST JSON a un endpoint REST (Azure Function -> SQL Server).
-    - Adesso: PUT diretto al Blob Storage, riusando la Shared Key esistente.
+    Cambio architetturale v1.22:
+    - Prima (v1.21): POST JSON ad Azure Function -> SQL Server (latenza alta,
+      backend custom da mantenere).
+    - Adesso: POST JSON direttamente ad Event Hubs (real-time, ingestion
+      nativa Fabric Eventstream, niente backend intermedio).
     """
 
     def __init__(self, dm):
@@ -1645,11 +1805,8 @@ class CloudUploader:
         if not self.dm.cloud_boat_id:
             self.last_error = 'cloud_boat_id non configurato'
             return
-        if not (self.dm.cloud_api_url or '').strip():
-            self.last_error = 'cloud_api_url non configurato'
-            return
-        if not (self.dm.cloud_api_key or '').strip():
-            self.last_error = 'cloud_api_key non configurato'
+        if not (self.dm.eventhub_connection_string or '').strip():
+            self.last_error = 'eventhub_connection_string non configurata'
             return
 
         # 1) Drena la coda offline (max 50 record per ciclo per non
@@ -1778,57 +1935,82 @@ class CloudUploader:
                 return sum(1 for _ in f if _.strip())
         except: return 0
 
-    # ----- HTTP PUT al Blob Storage con force-cellular su Android -----
+    # ----- POST HTTPS ad Azure Event Hubs (v1.22+) -----
     #
-    # CAMBIO ARCHITETTURALE (v1.19):
-    # Prima il CloudUploader faceva POST JSON a un endpoint REST esterno
-    # (webhook.site / Azure Function), che a sua volta scriveva su SQL Server.
-    # Adesso fa PUT diretto al container 'trackslive' del Blob Storage, come
-    # TrackUploader fa con i CSV in 'tracks'. Vantaggi:
-    # - Niente backend intermedio da mantenere (no Function, no DB).
-    # - Stesso meccanismo Shared Key gia' collaudato per i CSV.
-    # - Coerente con il resto dell'app (download polar/waypoints/meteo via blob).
+    # CAMBIO ARCHITETTURALE (v1.22):
+    # Prima (v1.21): POST JSON ad Azure Function ingest, che a sua volta
+    # scriveva su SQL Server. Latenza alta, backend custom da mantenere.
+    # Adesso: POST JSON diretto ad Event Hubs HTTPS. La Fabric Eventstream
+    # legge dall'hub e alimenta la dashboard real-time. Vantaggi:
+    # - Niente backend intermedio (no Function, no DB).
+    # - Ingestion ottimizzata per streaming real-time.
+    # - Integrazione nativa con Fabric Eventstream/Eventhouse/Power BI live.
     #
-    # Il campo 'cloud_url' nel config e' ora IGNORATO da questo flusso (resta
-    # per compat ma non usato). L'URL e' composto al volo come:
-    #   {blob_base}/trackslive/{cloud_boat_id}/{timestamp}.json
-    # Filename: timestamp UTC con ':' sostituiti da '-' (i ':' non sono validi
-    # nei nomi blob su alcuni client). Un file per snapshot, niente collisioni.
+    # Auth: SAS token generato lato client dalla connection string. TTL 1h,
+    # rigenerato in cache quando vicino a scadere. Niente fallback chiave
+    # master: la connection string e' essa stessa una "policy" di accesso.
+
+    def _ensure_eventhub_sas(self):
+        """Garantisce che self.dm._eventhub_sas contenga un SAS token valido.
+        Se manca o scade nei prossimi 5 minuti, lo rigenera.
+
+        Side-effect: imposta anche self.dm._eventhub_url (cached).
+
+        Restituisce (ok, err): se err non e' None, e' un messaggio di errore
+        utile per il caller (es. connection string malformata).
+        """
+        # Parse della connection string (cache)
+        if self.dm._eventhub_parsed is None:
+            try:
+                self.dm._eventhub_parsed = parse_eventhub_connection_string(
+                    self.dm.eventhub_connection_string)
+            except ValueError as e:
+                return False, f'connection string: {e}'
+        parsed = self.dm._eventhub_parsed
+        if not parsed.get('entity_path'):
+            return False, ('EntityPath mancante nella connection string '
+                           '(serve il nome dell\'hub)')
+        # URL HTTPS (cache)
+        if self.dm._eventhub_url is None:
+            try:
+                self.dm._eventhub_url = eventhub_https_url(
+                    parsed['endpoint'], parsed['entity_path'])
+            except ValueError as e:
+                return False, f'url: {e}'
+        # SAS token: rigenera se assente o quasi scaduto (< 5min residui)
+        now = time.time()
+        sas_cache = self.dm._eventhub_sas
+        if sas_cache is None or sas_cache[1] - now < 300:
+            try:
+                token, expiry = eventhub_sas_token(
+                    parsed['endpoint'], parsed['key_name'],
+                    parsed['key'], parsed['entity_path'],
+                    ttl_seconds=3600)
+                self.dm._eventhub_sas = (token, expiry)
+            except Exception as e:
+                return False, f'SAS gen: {type(e).__name__}: {e}'
+        return True, None
 
     def _post_json(self, payload):
-        """POST snapshot JSON all'endpoint Azure Function che lo scrive
-        su SQL Server. Sostituisce il vecchio PUT al blob trackslive.
-
-        Auth: Function Key in header 'x-functions-key'.
-
-        Idempotenza: l'app genera un request_id (UUID) lato client che la
-        Function usa come dedup key. Se la coda offline rispedisce lo
-        stesso snapshot, la Function risponde 200 senza duplicare.
+        """POST snapshot JSON ad Azure Event Hubs.
 
         Restituisce (ok: bool, err: str|None). In caso di errore il chiamante
         accumula nella coda offline."""
         if not self.dm.cloud_boat_id:
             return False, 'cloud_boat_id non configurato'
-        if not (self.dm.cloud_api_url or '').strip():
-            return False, 'cloud_api_url non configurato'
-        if not (self.dm.cloud_api_key or '').strip():
-            return False, 'cloud_api_key non configurato'
+        if not (self.dm.eventhub_connection_string or '').strip():
+            return False, 'eventhub_connection_string non configurata'
 
-        # Assicuriamoci che il payload abbia un request_id. Se manca (es.
-        # snapshot vecchio dalla coda offline pre-v1.21), ne generiamo uno
-        # qui: meglio una piccola perdita di idempotenza che bloccare il
-        # drain.
-        if 'request_id' not in payload:
-            import uuid
-            payload = dict(payload)
-            payload['request_id'] = str(uuid.uuid4())
+        # Assicura SAS valido (rigenerato se serve)
+        ok, err = self._ensure_eventhub_sas()
+        if not ok:
+            return False, err
 
-        return self._post_to_function(payload, _SSL_CTX_VERIFIED)
+        return self._post_to_eventhub(payload, _SSL_CTX_VERIFIED)
 
     def _is_test_host(self, url):
-        """Legacy: usato in passato per il fallback SSL su webhook.site.
-        Mantenuto solo per compat: blob.core.windows.net richiede sempre
-        SSL verificato, quindi questo metodo restituira' sempre False."""
+        """Legacy: helper SSL fallback per webhook.site. Eventhubs richiede
+        sempre TLS verificato, quindi questo metodo restituisce sempre False."""
         try:
             from urllib.parse import urlparse
             host = urlparse(url).hostname or ''
@@ -1836,27 +2018,31 @@ class CloudUploader:
         except Exception:
             return False
 
-    def _post_to_function(self, payload, ssl_ctx):
-        """Singolo tentativo POST all'Azure Function ingest che persiste
-        lo snapshot su SQL Server.
+    def _post_to_eventhub(self, payload, ssl_ctx):
+        """Singolo tentativo POST ad Azure Event Hubs.
 
-        Endpoint: self.dm.cloud_api_url
-        Auth: header 'x-functions-key' con self.dm.cloud_api_key
+        Endpoint:    self.dm._eventhub_url (https POST)
+        Auth header: Authorization = SAS token (cached in self.dm._eventhub_sas[0])
+        Body:        JSON serialization del payload.
 
         Su Android forza la rete cellulare se disponibile (bypassa il WiFi
         di bordo senza uplink).
 
-        Restituisce (ok: bool, err: str|None). Restituisce True anche per
-        risposta 'duplicate' (200 OK con status='duplicate'): la Function
-        ha gia' lo snapshot, drenarlo dalla coda offline e' OK.
+        Risposta Event Hubs:
+        - 201 Created: evento accettato.
+        - 401: SAS scaduto/malformato (rigeneriamo al prossimo ciclo).
+        - 403: policy senza permesso Send sul namespace/hub.
+        - 404: hub non esistente (EntityPath errato).
+        - 413: payload troppo grande (>1MB).
         """
         try:
             data = json.dumps(payload).encode('utf-8')
+            token = self.dm._eventhub_sas[0]  # garantito valido da _ensure
             req = urllib.request.Request(
-                self.dm.cloud_api_url, data=data, method='POST',
+                self.dm._eventhub_url, data=data, method='POST',
                 headers={
-                    'Content-Type':     'application/json',
-                    'x-functions-key':  self.dm.cloud_api_key,
+                    'Content-Type':   'application/json',
+                    'Authorization':  token,
                 })
             sock_factory = self._cellular_socket_factory()
             if sock_factory:
@@ -1886,7 +2072,12 @@ class CloudUploader:
                 body = e.read().decode('utf-8', errors='replace')[:200]
             except Exception:
                 body = ''
-            log_err(f'CloudUploader POST HTTP {e.code} on {self.dm.cloud_api_url}: {body[:400]}')
+            # Se 401 invalido, invalida la cache cosi' al prossimo ciclo
+            # generiamo un token fresco
+            if e.code == 401:
+                self.dm._eventhub_sas = None
+            log_err(f'CloudUploader POST HTTP {e.code} on '
+                    f'{self.dm._eventhub_url}: {body[:400]}')
             return False, f'HTTP {e.code}: {body}'.strip()
         except urllib.error.URLError as e:
             r = getattr(e, 'reason', e)
@@ -1897,7 +2088,7 @@ class CloudUploader:
             log_err(f'CloudUploader POST URL: {r}')
             return False, f'URL: {r}'
         except socket.timeout:
-            log_err(f'CloudUploader POST timeout on {self.dm.cloud_api_url}')
+            log_err(f'CloudUploader POST timeout on {self.dm._eventhub_url}')
             return False, 'Timeout'
         except Exception as e:
             log_err(f'CloudUploader POST: {type(e).__name__}: {e}', exc=e)
@@ -2268,8 +2459,13 @@ class DataManager:
         except (TypeError, ValueError): cs = 60
         self.cloud_interval_s = cs if cs in (30, 60, 120, 300, 600) else 60
         # URL endpoint Azure Function + Function Key
-        self.cloud_api_url = (c.get('cloud_api_url', '') or '').strip()
-        self.cloud_api_key = (c.get('cloud_api_key', '') or '').strip()
+        self.eventhub_connection_string = (
+            c.get('eventhub_connection_string', '') or '').strip()
+        # Cache del SAS token Event Hubs (rigenerato quando scaduto).
+        # Inizializzato a None: viene popolato al primo invio.
+        self._eventhub_sas = None        # (token_str, expiry_unix_ts)
+        self._eventhub_url = None        # URL HTTPS POST
+        self._eventhub_parsed = None     # dict parsato della conn string
         # === Azure Blob Storage ===
         bb = (c.get('blob_base', '') or '').strip().rstrip('/')
         self.blob_base = bb if bb else BLOB_BASE_DEFAULT
@@ -2444,8 +2640,7 @@ class DataManager:
                    'cloud_enabled':      self.cloud_enabled,
                    'cloud_boat_id':      self.cloud_boat_id,
                    'cloud_interval_s':   self.cloud_interval_s,
-                   'cloud_api_url':      self.cloud_api_url,
-                   'cloud_api_key':      self.cloud_api_key,
+                   'eventhub_connection_string': self.eventhub_connection_string,
                    'blob_base':          self.blob_base,
                    'blob_sas_token':     self.blob_sas_token,
                    'blob_account_key':   self.blob_account_key,
@@ -6397,6 +6592,7 @@ class SettingsScreen(TabScreen):
                 f"TWD window:  {dm.twd_window_minutes} min\n"
                 f"Cloud:       {'ON' if dm.cloud_enabled else 'OFF'} ({dm.cloud_interval_s}s)\n"
                 f"Cloud BoatID:{bid_disp}\n"
+                f"EventHub CS: {'(impostata)' if dm.eventhub_connection_string else '(VUOTA)'}\n"
                 f"Blob base:   {dm.blob_base}\n"
                 f"Account key: {key_disp}\n"
                 f"Waypoints:   {len(dm.waypoints)}\n"
