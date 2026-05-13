@@ -259,12 +259,6 @@ LOG_DIR        = 'logs'
 SIDEBAR_W   = dp(155)
 TITLE_H     = dp(60)
 BOX_H       = dp(200)  # Mantenuto solo per riferimento (non piu' usato come altezza fissa)
-# URL di default per il cloud upload "legacy" (HTTPS POST a endpoint REST).
-# Dal v1.19 il CloudUploader fa PUT diretto al container 'trackslive' del
-# blob storage, quindi questo campo e' IGNORATO dal flusso live. Resta nel
-# config per backward-compat (vecchie versioni che leggevano l'URL).
-CLOUD_URL_DEFAULT = 'https://sailing-api-7960.azurewebsites.net/api/track'
-
 # =============================================================================
 # AZURE BLOB STORAGE -- accesso diretto con Shared Key auth (v1.10+)
 # =============================================================================
@@ -302,12 +296,6 @@ BOAT_ID_DEFAULT         = 'soar'
 # File previsioni meteo precaricate dal backend nel blob 'meteo/{boat}/'.
 # Formato JSON definito in WeatherScreen.parse_forecast() (vedi docstring).
 METEO_FILE              = 'forecast.json'
-
-# Base URL del servizio cloud (legacy: backward-compat per config esistenti).
-# Il campo 'api_base' nel sailing_config.json e' ora ignorato dal flusso
-# download (sostituito da blob_base) ma resta letto per non rompere config
-# vecchi. Tenuto solo per compatibilita'.
-API_BASE_DEFAULT = 'https://sailing-api-7960.azurewebsites.net/api/boats'
 
 # ---- Parametri switch automatico waypoint target ----
 # Soglia in NM sotto la quale consideriamo "vicini" alla boa. 0.027 NM ~= 50m.
@@ -447,6 +435,51 @@ def _account_name_from_blob_base(blob_base):
         return host.split('.')[0] if host else ''
     except Exception:
         return ''
+
+
+def authorize_blob_request(req, dm):
+    """Autentica una richiesta al Blob Storage scegliendo SAS o Shared Key.
+
+    Logica di selezione:
+    1) Se dm.blob_sas_token e' popolato -> APPENDE il SAS come query string
+       all'URL della Request. Niente header Authorization.
+    2) Altrimenti se dm.blob_account_key e' popolata -> firma con Shared Key
+       (HMAC-SHA256) via azure_sign_request(). Aggiunge header
+       x-ms-date, x-ms-version, Authorization.
+    3) Se nessuno dei due -> solleva ValueError. Il chiamante decide se
+       degradare a richiesta anonima (es. download da container pubblico).
+
+    IMPORTANTE: deve essere chiamata DOPO aver settato tutti gli header
+    che influenzano la firma (Content-Type, x-ms-blob-type, ecc.) e
+    DOPO aver costruito l'URL finale.
+
+    Per il SAS path, la funzione MODIFICA req.full_url appendendo la SAS.
+    Per via di come funziona urllib.request.Request, riassegniamo il
+    .full_url tramite il setter interno.
+
+    Restituisce req (sempre lo stesso oggetto, eventualmente modificato).
+    Solleva ValueError se nessun metodo di auth e' disponibile.
+    """
+    sas = (getattr(dm, 'blob_sas_token', '') or '').lstrip('?').strip()
+    if sas:
+        # Appendi SAS alla URL. Se l'URL ha gia' una query string (es. per
+        # comp=list), uso '&', altrimenti '?'.
+        url = req.full_url
+        sep = '&' if ('?' in url) else '?'
+        new_url = f'{url}{sep}{sas}'
+        # urllib.request.Request espone full_url come property settabile
+        req.full_url = new_url
+        return req
+    key = (getattr(dm, 'blob_account_key', '') or '').strip()
+    if key:
+        base = getattr(dm, 'blob_base', '') or BLOB_BASE_DEFAULT
+        account_name = _account_name_from_blob_base(base)
+        if not account_name:
+            raise ValueError('blob_base non valido (impossibile estrarre account_name)')
+        azure_sign_request(req, account_name, key)
+        return req
+    raise ValueError('Ne blob_sas_token ne blob_account_key configurati')
+
 
 def get_data_dir():
     """Restituisce la directory dove salvare config, polari e log.
@@ -671,12 +704,12 @@ class ErrorLogger:
         Restituisce (ok_bool, msg_str)."""
         if not dm.cloud_boat_id:
             return False, 'cloud_boat_id non configurato'
-        if not (dm.blob_account_key or '').strip():
-            return False, 'blob_account_key non configurato'
+        # Verifica almeno una credenziale presente
+        has_sas = bool((getattr(dm, 'blob_sas_token', '') or '').strip())
+        has_key = bool((getattr(dm, 'blob_account_key', '') or '').strip())
+        if not (has_sas or has_key):
+            return False, 'ne blob_sas_token ne blob_account_key configurati'
         base = (dm.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
-        account_name = _account_name_from_blob_base(base)
-        if not account_name:
-            return False, 'blob_base non valido'
 
         files = self.list_log_files()
         if only_today:
@@ -701,7 +734,7 @@ class ErrorLogger:
                         'Content-Type':   'text/plain; charset=utf-8',
                         'x-ms-blob-type': 'BlockBlob',
                     })
-                azure_sign_request(req, account_name, dm.blob_account_key)
+                authorize_blob_request(req, dm)
                 ctx = _SSL_CTX_VERIFIED or ssl.create_default_context()
                 with urllib.request.urlopen(req, timeout=timeout,
                                              context=ctx) as resp:
@@ -961,13 +994,14 @@ def _format_waypoints_file(wpts):
     return '\n'.join(parts) + '\n'
 
 
-def fetch_remote_config(blob_base, boat_id, blob_account_key, timeout=8):
-    """Scarica sailing_config.json dal blob storage cloud per la barca data.
+def fetch_remote_config(dm, timeout=8):
+    """Scarica sailing_config.json dal blob storage cloud per la barca corrente.
 
     URL pattern:
         {blob_base}/config/{boat_id}/sailing_config.json
 
-    Usa Shared Key auth (HMAC-SHA256) come tutto il resto del v1.10+.
+    Usa la stessa auth degli altri metodi: SAS token se presente, altrimenti
+    Shared Key. Vedi authorize_blob_request().
 
     Restituisce:
         (True, dict_config, None) se download e parse OK
@@ -975,22 +1009,23 @@ def fetch_remote_config(blob_base, boat_id, blob_account_key, timeout=8):
 
     Casi di fallimento gestiti (tutti finiscono in fallback ai default):
     - 404 (blob non esistente per questa barca, caso normale)
-    - 403 (chiave non valida o container con restrizioni)
+    - 403 (credenziali invalide o container con restrizioni)
     - Timeout/DNS/rete (offline al primo avvio)
     - JSON malformato sul cloud
     """
+    blob_base = getattr(dm, 'blob_base', '')
+    boat_id   = getattr(dm, 'cloud_boat_id', '')
     if not blob_base or not boat_id:
         return (False, None, 'blob_base/boat_id non configurati')
-    if not (blob_account_key or '').strip():
-        return (False, None, 'blob_account_key non configurato')
-    account_name = _account_name_from_blob_base(blob_base)
-    if not account_name:
-        return (False, None, 'blob_base non valido')
+    has_sas = bool((getattr(dm, 'blob_sas_token', '') or '').strip())
+    has_key = bool((getattr(dm, 'blob_account_key', '') or '').strip())
+    if not (has_sas or has_key):
+        return (False, None, 'ne blob_sas_token ne blob_account_key configurati')
     url = (f'{blob_base.rstrip("/")}'
            f'/{BLOB_CONTAINER_CONFIG}/{boat_id}/{CONFIG_FILE}')
     try:
         req = urllib.request.Request(url, method='GET')
-        azure_sign_request(req, account_name, blob_account_key)
+        authorize_blob_request(req, dm)
         ctx = _SSL_CTX_VERIFIED or ssl.create_default_context()
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             if resp.status != 200:
@@ -1020,33 +1055,42 @@ def default_config():
     DataManager.__init__ (per inizializzare gli attributi) sia da _load_cfg
     quando il file sailing_config.json non esiste (per crearlo al primo avvio).
 
-    Modifica qui per cambiare i default 'fabbrica' dell'app."""
+    Modifica qui per cambiare i default 'fabbrica' dell'app.
+
+    Pulizia v1.20: rimossi campi obsoleti che non sono piu' usati dal codice
+    dopo il passaggio al flusso PUT diretto al Blob Storage:
+    - 'cloud_url':   era endpoint REST (sailing-api Azure Function). Sostituito
+                      da PUT diretto al container 'trackslive'.
+    - 'cloud_token': Bearer per autorizzare cloud_url. Obsoleto.
+    - 'api_base':    base URL servizio cloud per download. Mai consumato.
+    - 'polar_path':  forzato a POLAR_PATH a runtime (sandbox sicura).
+    - 'log_dir':     forzato a LOG_PATH a runtime (sandbox sicura).
+    """
     return {
         # Connessione NMEA TCP (router di bordo)
         'nmea_ip':            '192.168.1.4',
         'nmea_port':          60001,
-        # Path file
-        'polar_path':         POLAR_PATH,
-        'log_dir':            LOG_PATH,
         # Tattica: finestra TWD per analisi lato buono / vira (minuti)
         'twd_window_minutes': 5,
-        # Cloud upload live (snapshot periodico). Dal v1.19 fa PUT diretto
-        # al container 'trackslive' del blob storage. Il campo 'cloud_url'
-        # resta nel config per backward-compat ma e' IGNORATO dal flusso.
+        # Cloud upload live (snapshot periodico al blob 'trackslive')
         'cloud_enabled':      False,
-        'cloud_url':          CLOUD_URL_DEFAULT,
         'cloud_boat_id':      BOAT_ID_DEFAULT,
-        'cloud_token':        '016WFv2hWiOedqR4v5qgMP30SLRPOp2kWUR-0pBkfPE',
         # Intervallo upload in secondi. Valori UI ammessi: 30,60,120,300,600.
         # Min hard floor 30s nel CloudUploader._loop().
         'cloud_interval_s':   60,
-        # Base URL del servizio cloud (legacy, non piu' usato per download).
-        'api_base':           API_BASE_DEFAULT,
-        # === Azure Blob Storage (autenticazione via Shared Key) ===
-        # blob_base: URL base dello storage account.
-        # blob_account_key: chiave master dello storage account (da Azure
-        # Portal > Storage Account > Access Keys). Usata per firmare le
-        # richieste HTTP al blob storage con HMAC-SHA256 (Shared Key auth).
+        # === Azure Blob Storage ===
+        # Due autenticazioni alternative supportate:
+        # A) SAS token (preferita: piu' sicura, scade, permessi limitati)
+        #    -> blob_sas_token: stringa con la query SAS senza il '?' iniziale
+        #       es. 'sv=2025-11-05&ss=bfqt&srt=sco&sp=rwdlacupyx&se=...&sig=...'
+        #    -> Generato dal portale Azure: Storage Account > Shared access
+        #       signature > permessi richiesti + scadenza + sig.
+        # B) Account Key (Shared Key HMAC-SHA256)
+        #    -> blob_account_key: chiave master in base64 dal portale Azure
+        #       (Storage Account > Access Keys). Da' accesso TOTALE allo
+        #       storage account, nessuna scadenza.
+        # Selezione automatica in authorize_blob_url(): se blob_sas_token e'
+        # popolato lo usa; altrimenti fallback alla Account Key.
         # Container usati (sotto-cartella per boat_id):
         #   {blob_base}/polars/{cloud_boat_id}/polar.json     (download GET)
         #   {blob_base}/waypoints/{cloud_boat_id}/waypoints.json (download GET)
@@ -1055,9 +1099,11 @@ def default_config():
         #   {blob_base}/trackslive/{cloud_boat_id}/{ts}.json   (upload PUT live)
         #   {blob_base}/config/{cloud_boat_id}/sailing_config.json (download GET)
         #   {blob_base}/logs/{cloud_boat_id}/errors_*.log     (upload PUT log)
-        # ATTENZIONE: la chiave da' accesso completo allo storage account.
-        # Non condividere il sailing_config.json con altri tablet/utenti.
         'blob_base':          BLOB_BASE_DEFAULT,
+        'blob_sas_token':     ('sv=2025-11-05&ss=bfqt&srt=sco&sp=rwdlacupyx'
+                               '&se=2035-05-13T07:57:51Z&st=2026-05-12T23:42:51Z'
+                               '&spr=https&sig=xRlxv%2F9J4oqbVd5AUR%2F'
+                               'OALLSRT7ON4MxjvTlpcf4oAo%3D'),
         'blob_account_key':   ('ruLSMqmQjnqYRQVXrFtmZmfB4JHXU4nRwyy5px7p'
                                'WplJgsbgHIsTl8mwk7lrxRz8W+Y+UV2zxA+j+ASt/NKXhQ=='),
         # Polare: flag globale ON/OFF. Quando False tutti i calcoli polar-aware
@@ -1569,8 +1615,10 @@ class CloudUploader:
         if not self.dm.cloud_boat_id:
             self.last_error = 'cloud_boat_id non configurato'
             return
-        if not (self.dm.blob_account_key or '').strip():
-            self.last_error = 'blob_account_key non configurato'
+        has_sas = bool((getattr(self.dm, 'blob_sas_token', '') or '').strip())
+        has_key = bool((getattr(self.dm, 'blob_account_key', '') or '').strip())
+        if not (has_sas or has_key):
+            self.last_error = 'ne blob_sas_token ne blob_account_key configurati'
             return
         if not (self.dm.blob_base or '').strip():
             self.last_error = 'blob_base non configurato'
@@ -1612,7 +1660,6 @@ class CloudUploader:
         twd_avg = dm.get_twd_average()
         snap = {
             'boat_id': dm.cloud_boat_id,
-            'token':   dm.cloud_token,
             'ts':      datetime.now(timezone.utc).isoformat(),
             'gps': {
                 'lat': dm.gps_lat,
@@ -1720,21 +1767,18 @@ class CloudUploader:
 
         if not self.dm.cloud_boat_id:
             return False, 'cloud_boat_id non configurato'
-        if not (self.dm.blob_account_key or '').strip():
-            return False, 'blob_account_key non configurato'
+        has_sas = bool((getattr(self.dm, 'blob_sas_token', '') or '').strip())
+        has_key = bool((getattr(self.dm, 'blob_account_key', '') or '').strip())
+        if not (has_sas or has_key):
+            return False, 'ne blob_sas_token ne blob_account_key configurati'
 
         base = (self.dm.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
-        account_name = _account_name_from_blob_base(base)
-        if not account_name:
-            return False, 'blob_base non valido'
         from urllib.parse import quote
         safe = quote(filename, safe='._-')
         url = (f'{base}/{BLOB_CONTAINER_TRACKSLIVE}/'
                f'{self.dm.cloud_boat_id}/{safe}')
 
-        return self._put_to_blob_attempt(url, payload, account_name,
-                                          self.dm.blob_account_key,
-                                          _SSL_CTX_VERIFIED)
+        return self._put_to_blob_attempt(url, payload, _SSL_CTX_VERIFIED)
 
     def _is_test_host(self, url):
         """Legacy: usato in passato per il fallback SSL su webhook.site.
@@ -1747,16 +1791,15 @@ class CloudUploader:
         except Exception:
             return False
 
-    def _put_to_blob_attempt(self, url, payload, account_name, account_key,
-                              ssl_ctx):
+    def _put_to_blob_attempt(self, url, payload, ssl_ctx):
         """Singolo tentativo PUT al blob storage di UN snapshot JSON.
 
         Header obbligatori Azure Blob:
         - x-ms-blob-type: BlockBlob
         - Content-Type:   application/json
-        - Content-Length: (necessario per la firma Shared Key)
 
-        Firma Shared Key (HMAC-SHA256) via azure_sign_request().
+        Autenticazione delegata a authorize_blob_request(req, dm) che
+        sceglie SAS token o Shared Key in base a quale e' configurato.
 
         Su Android forza la rete cellulare se disponibile (bypassa il WiFi
         di bordo senza uplink).
@@ -1769,7 +1812,7 @@ class CloudUploader:
                     'Content-Type':   'application/json',
                     'x-ms-blob-type': 'BlockBlob',
                 })
-            azure_sign_request(req, account_name, account_key)
+            authorize_blob_request(req, self.dm)
             sock_factory = self._cellular_socket_factory()
             if sock_factory:
                 orig = socket.create_connection
@@ -2156,7 +2199,7 @@ class DataManager:
           ma vengono SOVRASCRITTI al salvataggio successivo con i valori
           correnti, garantendo che il file rifletta sempre lo stato reale.
         """
-        self.nmea_ip   = c.get('nmea_ip',   '192.168.4.1')
+        self.nmea_ip   = c.get('nmea_ip',   '192.168.1.4')
         self.nmea_port = c.get('nmea_port', 60001)
         # Forziamo SEMPRE i path sandbox calcolati a runtime, ignorando
         # qualunque valore salvato nel config (puo' essere stale tra release).
@@ -2165,12 +2208,9 @@ class DataManager:
         tw = c.get('twd_window_minutes', 5)
         self.twd_window_minutes = tw if tw in (2, 5, 10, 15, 20) else 5
         self.cloud_enabled      = bool(c.get('cloud_enabled', False))
-        url_in_cfg = (c.get('cloud_url', '') or '').strip()
-        self.cloud_url          = url_in_cfg if url_in_cfg else CLOUD_URL_DEFAULT
-        # boat_id: default 'soar' se mancante o vuoto (era 'regolofarm-1')
+        # boat_id: default 'soar' se mancante o vuoto
         bid = (c.get('cloud_boat_id', '') or '').strip()
         self.cloud_boat_id      = bid if bid else BOAT_ID_DEFAULT
-        self.cloud_token        = c.get('cloud_token',   '')
         # Intervallo upload in secondi. Migrazione automatica dal vecchio
         # 'cloud_interval_min' (minuti) se presente in config legacy.
         cs = c.get('cloud_interval_s')
@@ -2182,27 +2222,17 @@ class DataManager:
         try: cs = int(cs)
         except (TypeError, ValueError): cs = 60
         self.cloud_interval_s = cs if cs in (30, 60, 120, 300, 600) else 60
-        # Base URL del servizio cloud (legacy, mantenuto per compat config).
-        # Retrocompatibilita': accetta anche il vecchio nome
-        # 'waypoints_api_base' usato in versioni precedenti.
-        wb = (c.get('api_base', '') or
-              c.get('waypoints_api_base', '') or '').strip()
-        self.api_base = wb if wb else API_BASE_DEFAULT
         # === Azure Blob Storage ===
         bb = (c.get('blob_base', '') or '').strip().rstrip('/')
         self.blob_base = bb if bb else BLOB_BASE_DEFAULT
-        # blob_account_key: chiave master dello storage account, usata per
-        # firmare le richieste con Shared Key (HMAC-SHA256). Se vuota, le
-        # operazioni cloud (upload/download tracks, upload polari/waypoints)
-        # falliranno con "blob_account_key non configurata".
+        # blob_sas_token: query string SAS (senza il '?' iniziale). Se
+        # popolato, viene preferito alla blob_account_key per ogni richiesta
+        # al blob storage. Vedi authorize_blob_url() per la logica di scelta.
+        # Esempio: 'sv=2025-11-05&ss=bfqt&srt=sco&sp=rwdlacupyx&...&sig=...'
+        self.blob_sas_token = (c.get('blob_sas_token', '') or '').lstrip('?').strip()
+        # blob_account_key: chiave master Shared Key. Fallback usato solo se
+        # blob_sas_token e' vuoto.
         self.blob_account_key = (c.get('blob_account_key', '') or '').strip()
-        # === Backward-compat con config v1.7-1.9 (SAS token) ===
-        # Se il config ha ancora i vecchi tracks_sas_token/polars/waypoints
-        # li leggiamo per non rompere setup esistenti, ma il flusso primario
-        # usa blob_account_key. Vengono ignorati nei nuovi flussi.
-        self.tracks_sas_token    = (c.get('tracks_sas_token',    '') or '').strip()
-        self.polars_sas_token    = (c.get('polars_sas_token',    '') or '').strip()
-        self.waypoints_sas_token = (c.get('waypoints_sas_token', '') or '').strip()
         # Polare ON/OFF: default True per non rompere comportamento esistente
         # quando si aggiorna l'app su un config gia' salvato.
         self.polar_enabled = bool(c.get('polar_enabled', True))
@@ -2267,8 +2297,7 @@ class DataManager:
             # da _apply_config(default_config()).
             print(f'_load_cfg: file locale assente ({self.config_path}), '
                   'tento fetch da cloud...')
-            ok, cloud_cfg, err = fetch_remote_config(
-                self.blob_base, self.cloud_boat_id, self.blob_account_key)
+            ok, cloud_cfg, err = fetch_remote_config(self)
             if ok:
                 try:
                     self._apply_config(cloud_cfg)
@@ -2301,20 +2330,21 @@ class DataManager:
             # campi previsti dalla versione corrente di default_config(), li
             # aggiungiamo (con i default) riscrivendo il file. Questo accade
             # quando l'utente aggiorna l'app a una versione che introduce
-            # nuovi campi (es. 'blob_account_key' aggiunto nella v1.10 per
-            # autenticazione Shared Key).
+            # nuovi campi (es. 'blob_account_key' aggiunto nella v1.10) o
+            # quando RIMUOVE campi obsoleti (es. 'cloud_url', 'cloud_token',
+            # 'api_base', 'polar_path', 'log_dir' rimossi in v1.20).
             # NB: il valore di 'cloud_boat_id' NON viene rimpiazzato: se il
             # config aveva 'regolofarm-1', resta tale. Per usare 'soar' va
             # cambiato esplicitamente da Settings o nel file.
             expected_keys = set(default_config().keys())
             actual_keys   = set(c.keys()) if isinstance(c, dict) else set()
             missing = expected_keys - actual_keys
-            has_legacy_name = 'waypoints_api_base' in actual_keys
-            if missing or has_legacy_name:
+            obsolete = actual_keys - expected_keys
+            if missing or obsolete:
                 if missing:
                     print(f'Config: campi mancanti {sorted(missing)}, riscrivo con default')
-                if has_legacy_name:
-                    print('Config: rinomino "waypoints_api_base" in "api_base"')
+                if obsolete:
+                    print(f'Config: campi obsoleti {sorted(obsolete)}, rimuovo dal file')
                 try:
                     self.save_cfg()
                 except Exception as e:
@@ -2362,16 +2392,12 @@ class DataManager:
         # DM ("45°45.164'N") per coerenza con waypoints.json.
         payload = {'nmea_ip':            self.nmea_ip,
                    'nmea_port':          self.nmea_port,
-                   'polar_path':         self.polar_path,
-                   'log_dir':            self.log_dir,
                    'twd_window_minutes': self.twd_window_minutes,
                    'cloud_enabled':      self.cloud_enabled,
-                   'cloud_url':          self.cloud_url,
                    'cloud_boat_id':      self.cloud_boat_id,
-                   'cloud_token':        self.cloud_token,
                    'cloud_interval_s':   self.cloud_interval_s,
-                   'api_base':           self.api_base,
                    'blob_base':          self.blob_base,
+                   'blob_sas_token':     self.blob_sas_token,
                    'blob_account_key':   self.blob_account_key,
                    'polar_enabled':      self.polar_enabled,
                    'waypoints':          self._serialize_waypoints(),
@@ -2515,19 +2541,16 @@ class DataManager:
         Pattern URL: {blob_base}/tracks/{cloud_boat_id}/{filename}
         Restituisce (ok, msg).
 
-        Usa Shared Key auth. Sicuro perche' la firma HMAC-SHA256 e' calcolata
-        sui contenuti, anche senza TLS verification l'integrita' e' garantita."""
+        Autenticazione: SAS token o Shared Key, vedi authorize_blob_request()."""
         if not os.path.exists(csv_path):
             return False, f'File non trovato: {csv_path}'
         if not self.cloud_boat_id:
             return False, 'cloud_boat_id non configurato'
-        account_key = (self.blob_account_key or '').strip()
-        if not account_key:
-            return False, 'blob_account_key non configurata'
+        has_sas = bool((getattr(self, 'blob_sas_token', '') or '').strip())
+        has_key = bool((getattr(self, 'blob_account_key', '') or '').strip())
+        if not (has_sas or has_key):
+            return False, 'ne blob_sas_token ne blob_account_key configurati'
         base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
-        account_name = _account_name_from_blob_base(base)
-        if not account_name:
-            return False, 'blob_base non valido'
         try:
             with open(csv_path, 'rb') as f:
                 csv_data = f.read()
@@ -2542,7 +2565,7 @@ class DataManager:
                 url, data=csv_data, method='PUT',
                 headers={'Content-Type': 'text/csv',
                          'x-ms-blob-type': 'BlockBlob'})
-            azure_sign_request(req, account_name, account_key)
+            authorize_blob_request(req, self)
             with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
                 if resp.status >= 300:
                     return False, f'HTTP {resp.status}'
@@ -2582,20 +2605,16 @@ class DataManager:
                 'Accept': 'application/json',
                 'User-Agent': 'regolofarm-soar/1.0',
             })
-            # Se URL e' del blob storage configurato e abbiamo la chiave,
-            # firma con Shared Key. Altrimenti procedi senza auth.
+            # Se URL e' del blob storage configurato, autentica con SAS o
+            # Shared Key. Se nessuna credenziale e' disponibile, lascia
+            # la richiesta unsigned (puo' funzionare se il container e'
+            # pubblico).
             blob_base = (self.blob_base or '').strip().rstrip('/')
-            account_key = (self.blob_account_key or '').strip()
-            if blob_base and account_key and url.startswith(blob_base):
-                account_name = _account_name_from_blob_base(blob_base)
-                if account_name:
-                    try:
-                        azure_sign_request(req, account_name, account_key)
-                    except Exception as e:
-                        # Firma fallita: probabile chiave malformata. Lascio
-                        # andare la richiesta unsigned: se il container e'
-                        # pubblico funziona comunque.
-                        print(f'_http_get_json: firma Shared Key fallita: {e}')
+            if blob_base and url.startswith(blob_base):
+                try:
+                    authorize_blob_request(req, self)
+                except Exception as e:
+                    print(f'_http_get_json: auth blob fallita: {e}')
             with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
                 status = resp.getcode()
                 if status != 200:
@@ -5306,16 +5325,9 @@ class LoggingScreen(TabScreen):
             fr_row.add_widget(b)
         right.add_widget(fr_row)
 
-        # Stato cloud rimosso dalla UI (v1.20): il box nero "Stato:" e' stato
-        # eliminato per pulire la pagina. Eventuali messaggi di errore del
-        # CloudUploader finiscono nel log errori (visibile sotto in LOG ERRORI
-        # tramite il contatore "N errori catturati").
-        # Pulsante "Invia ora" (forza un ciclo immediato)
-        self._cloud_send_btn = mk_btn_gray('Invia subito',
-                                             self._cloud_send_now, sp(16))
-        self._cloud_send_btn.size_hint_y = None
-        self._cloud_send_btn.height = dp(56)
-        right.add_widget(self._cloud_send_btn)
+        # Stato cloud, pulsante "Invia subito" e relativa label rimossi nella
+        # v1.20: eventuali errori del CloudUploader finiscono nel log errori
+        # (visibile sotto in LOG ERRORI tramite "N errori catturati").
 
         # ----- LOG ERRORI: invio al cloud dei log di errore -----
         # I log vengono raccolti automaticamente in {LOG_PATH}/errors/ con
@@ -5464,18 +5476,6 @@ class LoggingScreen(TabScreen):
         self.dm.cloud_interval_s = secs
         self.dm.save_cfg_safe()
         self._refresh_cloud_buttons()
-
-    def _cloud_send_now(self, *_):
-        """Forza un ciclo di upload immediato. Feedback via popup breve perche'
-        il box di stato e' stato rimosso dalla UI (v1.20)."""
-        ok, err = self.dm.cloud.trigger_now()
-        if ok:
-            msg = 'Invio manuale lanciato'
-        else:
-            msg = f'Attendi: {err}' if err else 'Rate-limited'
-        Popup(title='Invio cloud',
-              content=Label(text=msg, halign='center', valign='middle'),
-              size_hint=(0.5, 0.22)).open()
 
     # ------------------------------------------------------------------
     # Upload log errori al cloud
@@ -6154,7 +6154,7 @@ class SettingsScreen(TabScreen):
             wpts_status = '(non presente — usa quelli del config)'
         # Valori effettivamente in memoria (dopo _load_cfg)
         bid_disp = dm.cloud_boat_id if dm.cloud_boat_id else '(VUOTO)'
-        tok_disp = '(impostato)' if dm.cloud_token else '(VUOTO)'
+        key_disp = '(impostato)' if dm.blob_account_key else '(VUOTO)'
         msg = (f"--- PATH ---\n"
                 f"Config:     {dm.config_path}  ({cfg_size})\n"
                 f"Polare:     {dm.polar_path}\n"
@@ -6166,9 +6166,9 @@ class SettingsScreen(TabScreen):
                 f"NMEA:        {dm.nmea_ip}:{dm.nmea_port}\n"
                 f"TWD window:  {dm.twd_window_minutes} min\n"
                 f"Cloud:       {'ON' if dm.cloud_enabled else 'OFF'} ({dm.cloud_interval_s}s)\n"
-                f"Cloud URL:   {dm.cloud_url}\n"
                 f"Cloud BoatID:{bid_disp}\n"
-                f"Cloud Token: {tok_disp}\n"
+                f"Blob base:   {dm.blob_base}\n"
+                f"Account key: {key_disp}\n"
                 f"Waypoints:   {len(dm.waypoints)}\n"
                 f"Boa attiva:  {dm.target_mark or '(nessuna)'}\n\n"
                 f"--- FILE GREZZO sul disco ---\n"
@@ -6246,8 +6246,7 @@ class SettingsScreen(TabScreen):
 
             def _worker():
                 dm = self.dm
-                ok, cloud_cfg, err = fetch_remote_config(
-                    dm.blob_base, dm.cloud_boat_id, dm.blob_account_key)
+                ok, cloud_cfg, err = fetch_remote_config(dm)
 
                 @mainthread
                 def _finish():
@@ -6392,31 +6391,6 @@ class SettingsScreen(TabScreen):
     # NOTA: i metodi _set_cloud_enabled, _set_cloud_freq, _refresh_cloud_buttons,
     # _cloud_send_now sono stati spostati nella LoggingScreen (v1.18) insieme
     # all'intera UI di gestione cloud.
-
-    def _reset_cloud_url(self):
-        """Ripristina l'URL del webhook di default e salva nel config."""
-        self.dm.cloud_url = CLOUD_URL_DEFAULT
-        self.dm.save_cfg_safe()
-
-    def _readonly_value_row(self,parent,label,value,font_value=None):
-        """Riga generica con label sx + valore in sola lettura.
-        Tap apre il popup 'Mostra path completo' che riassume tutti i settaggi."""
-        row=BoxLayout(spacing=dp(8),size_hint_y=None,height=dp(64))
-        row.add_widget(Label(text=label,font_size=sp(18),color=MUTED,
-                              size_hint_x=0.30,halign='right',valign='middle'))
-        b=Button(text=str(value),font_size=font_value or sp(15),
-                  color=WHITE,background_color=PANEL,
-                  background_normal='',halign='left',valign='middle')
-        b.bind(size=lambda l,_: setattr(l,'text_size',l.size))
-        b.bind(on_release=lambda _: self._show_path())
-        row.add_widget(b); parent.add_widget(row); return b
-
-    def _mask_token(self, token):
-        """Maschera il token per non mostrarlo in chiaro a video.
-        Mostra solo i primi 4 e ultimi 4 caratteri."""
-        if not token: return '(non impostato)'
-        if len(token) <= 8: return '*' * len(token)
-        return f'{token[:4]}...{token[-4:]}  ({len(token)} car.)'
 
     def _field(self,parent,label,value,kbtype='text'):
         """Campo testo editabile (label sx + TextInput dx)."""
