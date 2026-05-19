@@ -2326,6 +2326,10 @@ class DataManager:
         self.polar_vmg_target=None; self.polar_twa_target=None
         # Storico TWD per analisi tattica
         self._twd_history = deque(maxlen=4000)
+        # Ring buffer delle righe NMEA grezze ricevute (max 200).
+        # Thread-safe: deque con maxlen e' append-atomica su CPython.
+        # Usato dalla textbox di log nella SettingsScreen.
+        self.nmea_log = deque(maxlen=200)
         # ---- Stato per lo switch automatico della boa target ----
         # Quando la barca supera la boa attiva, advance_target_if_passed()
         # passa automaticamente al waypoint successivo nella lista. La logica
@@ -3649,6 +3653,10 @@ class DataManager:
                 break
 
     def _parse(self,raw):
+        # Log grezzo: timestamp + sentence, indipendente da pynmea2.
+        # Cosi' la textbox mostra i dati anche se la libreria manca.
+        ts_short = datetime.now().strftime('%H:%M:%S')
+        self.nmea_log.append(f'{ts_short} {raw}')
         if not HAS_PYNMEA2: return
         try: msg=pynmea2.parse(raw)
         except: return
@@ -4078,7 +4086,20 @@ class StartLineScreen(TabScreen):
         # insieme alla schermata Logging. Il tablet non scrive piu' tracks CSV
         # ne' fa upload al cloud. Per registrare i log delle uscite usa il
         # plotter di bordo o un'altra app dedicata.
-        left.add_widget(Widget())
+        # LOG NMEA: textbox nera read-only con le ultime righe ricevute
+        left.add_widget(Label(text='NMEA LOG',font_size=sp(18),color=ACCENT,
+                               bold=True,size_hint_y=None,height=dp(36)))
+        self._nmea_log_box = TextInput(
+            text='(nessun dato ricevuto)',
+            readonly=True,
+            multiline=True,
+            font_size=sp(11),
+            background_color=(0, 0, 0, 1),
+            foreground_color=GREEN,
+            cursor_color=(0, 0, 0, 0),
+            size_hint=(1, 1),
+        )
+        left.add_widget(self._nmea_log_box)
         self._cols.add_widget(left)
 
         right=BoxLayout(orientation='vertical',spacing=dp(8),
@@ -4092,8 +4113,10 @@ class StartLineScreen(TabScreen):
                              color=WHITE,size_hint_y=None,height=dp(70))
         right.add_widget(self._pin_lbl); right.add_widget(self._rc_lbl)
         br2=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(80))
-        br2.add_widget(mk_btn('Segna PIN',self._set_pin,sp(20)))
-        br2.add_widget(mk_btn('Segna RC', self._set_rc, sp(20)))
+        self._pin_btn = mk_btn('Segna PIN', self._toggle_pin, sp(20))
+        self._rc_btn  = mk_btn('Segna RC',  self._toggle_rc,  sp(20))
+        br2.add_widget(self._pin_btn)
+        br2.add_widget(self._rc_btn)
         right.add_widget(br2)
         self._line_lbl=Label(text='Lung: --   Brg: --',font_size=sp(30),
                               color=MUTED,size_hint_y=None,height=dp(60))
@@ -4120,48 +4143,97 @@ class StartLineScreen(TabScreen):
         if rem<=0: self._t.text='0:00'; self._t.color=RED; self._run=False; return False
         m,s=int(rem//60),int(rem%60)
         self._t.text=f'{m}:{s:02d}'; self._t.color=RED if rem<60 else GREEN; return True
-    def _set_pin(self):
-        """Memorizza la posizione GPS corrente come pin di sinistra (boa di
-        partenza). Ogni pressione di 'Segna PIN' SOVRASCRIVE il valore
-        precedente con la posizione GPS attuale: non c'e' alcun accumulo
-        ne' storico, e' un override puro.
-
-        Pin e RC sono volatili: vivono solo in memoria nell'istanza dello
-        screen e NON vengono salvati su file. Al riavvio dell'app la linea
-        di partenza va ri-impostata. Intenzionale: la linea cambia ad ogni
-        regata e non avrebbe senso persistirla."""
-        dm = self.dm
-        if dm.gps_lat is None or dm.gps_lon is None:
+    def _toggle_pin(self):
+        """Toggle PIN: se non impostato lo segna (con fallback GPS interno),
+        se gia' impostato lo toglie. Il pulsante cambia testo di conseguenza.
+        Pin e RC sono volatili (in memoria, non persistiti su file)."""
+        if self._pin is not None:
+            # Togli PIN
+            self._pin = None
+            self._pin_lbl.text = 'Pin (SX): non impostato'
+            self._pin_lbl.color = WHITE
+            self._pin_btn.text = 'Segna PIN'
+            self._pin_btn.background_color = BTN_GRAY
+            self._line_lbl.text = 'Lung: --   Brg: --'
+            self._dist_lbl.text = 'Distanza: --  m'
+            return
+        # Segna PIN: usa NMEA o GPS interno
+        lat, lon, src = self._get_position()
+        if lat is None:
             self._pin_lbl.text = 'Pin (SX): GPS NON DISPONIBILE'
             self._pin_lbl.color = RED
             return
-        # Sovrascrittura esplicita: il valore vecchio (se c'era) viene perso.
-        had_previous = self._pin is not None
-        self._pin = (dm.gps_lat, dm.gps_lon)
-        prefix = 'Pin (SX) [aggiornato]:' if had_previous else 'Pin (SX):'
-        self._pin_lbl.text = f'{prefix} {dm.gps_lat:.5f}  {dm.gps_lon:.5f}'
+        self._pin = (lat, lon)
+        src_tag = ' [int]' if src == 'internal' else ''
+        self._pin_lbl.text = f'Pin (SX){src_tag}: {lat:.5f}  {lon:.5f}'
         self._pin_lbl.color = GREEN
+        self._pin_btn.text = 'Togli PIN'
+        self._pin_btn.background_color = ORANGE
         self._upd_line()
 
-    def _set_rc(self):
-        """Memorizza la posizione GPS corrente come committee boat (boa di
-        destra). Come 'Segna PIN', ogni pressione SOVRASCRIVE il valore
-        precedente. Vedi _set_pin per la nota sulla volatilita'."""
-        dm = self.dm
-        if dm.gps_lat is None or dm.gps_lon is None:
+    def _toggle_rc(self):
+        """Toggle RC: se non impostato lo segna (con fallback GPS interno),
+        se gia' impostato lo toglie. Vedi _toggle_pin per la logica generale."""
+        if self._rc is not None:
+            # Togli RC
+            self._rc = None
+            self._rc_lbl.text = 'RC  (DX): non impostato'
+            self._rc_lbl.color = WHITE
+            self._rc_btn.text = 'Segna RC'
+            self._rc_btn.background_color = BTN_GRAY
+            self._line_lbl.text = 'Lung: --   Brg: --'
+            return
+        # Segna RC
+        lat, lon, src = self._get_position()
+        if lat is None:
             self._rc_lbl.text = 'RC  (DX): GPS NON DISPONIBILE'
             self._rc_lbl.color = RED
             return
-        had_previous = self._rc is not None
-        self._rc = (dm.gps_lat, dm.gps_lon)
-        prefix = 'RC  (DX) [aggiornato]:' if had_previous else 'RC  (DX):'
-        self._rc_lbl.text = f'{prefix} {dm.gps_lat:.5f}  {dm.gps_lon:.5f}'
+        self._rc = (lat, lon)
+        src_tag = ' [int]' if src == 'internal' else ''
+        self._rc_lbl.text = f'RC  (DX){src_tag}: {lat:.5f}  {lon:.5f}'
         self._rc_lbl.color = GREEN
+        self._rc_btn.text = 'Togli RC'
+        self._rc_btn.background_color = ORANGE
         self._upd_line()
     def _upd_line(self):
         if self._pin and self._rc:
             d,b=calc_dist_brg(self._pin[0],self._pin[1],self._rc[0],self._rc[1])
             if d: self._line_lbl.text=f'Lung: {d*1852:.0f}m   Brg: {b:.1f}'
+
+    def _get_position(self):
+        """Restituisce (lat, lon, source) usando GPS NMEA se disponibile,
+        altrimenti tenta il GPS interno Android via plyer/android.GPS.
+        source e' 'nmea' | 'internal' | None (nessun GPS disponibile)."""
+        dm = self.dm
+        # Priorita' 1: GPS NMEA gia' fissato nel DataManager
+        if dm.gps_lat is not None and dm.gps_lon is not None:
+            return dm.gps_lat, dm.gps_lon, 'nmea'
+        # Priorita' 2: GPS interno Android (plyer)
+        try:
+            from plyer import gps as plyer_gps
+            loc = getattr(plyer_gps, 'last_location', None)
+            if loc and loc.get('lat') is not None:
+                return float(loc['lat']), float(loc['lon']), 'internal'
+        except Exception:
+            pass
+        # Priorita' 3: API Android diretta via pyjnius
+        if IS_ANDROID:
+            try:
+                from jnius import autoclass
+                ctx = autoclass('org.kivy.android.PythonActivity').mActivity
+                LocationManager = autoclass('android.location.LocationManager')
+                lm = ctx.getSystemService(LocationManager.SERVICE)
+                for provider in ('gps', 'network', 'passive'):
+                    try:
+                        loc = lm.getLastKnownLocation(provider)
+                        if loc is not None:
+                            return loc.getLatitude(), loc.getLongitude(), 'internal'
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        return None, None, None
 
     def tick(self,dt):
         super().tick(dt); dm=self.dm
@@ -5610,7 +5682,22 @@ class LoggingScreen(TabScreen):
             size=lambda l, _: setattr(l, 'text_size', l.size))
         right.add_widget(self._errlog_status)
 
-        right.add_widget(Widget())
+        # Textbox nera con il contenuto grezzo del file di log errori odierno.
+        # Si aggiorna ad ogni tick (quando la schermata e' attiva).
+        right.add_widget(Label(text='CONTENUTO LOG', font_size=sp(16),
+                                color=ACCENT, bold=True,
+                                size_hint_y=None, height=dp(36)))
+        self._errlog_box = TextInput(
+            text='(nessun errore registrato)',
+            readonly=True,
+            multiline=True,
+            font_size=sp(10),
+            background_color=(0, 0, 0, 1),
+            foreground_color=ORANGE,
+            cursor_color=(0, 0, 0, 0),
+            size_hint=(1, 1),
+        )
+        right.add_widget(self._errlog_box)
         outer.add_widget(right)
 
         # Stato iniziale
@@ -5805,6 +5892,27 @@ class LoggingScreen(TabScreen):
         super().tick(dt)
         self._refresh_log_ui()
         self._refresh_errlog_status()
+        self._refresh_errlog_box()
+
+    def _refresh_errlog_box(self):
+        """Aggiorna la textbox con il contenuto grezzo del log errori odierno.
+        Legge il file ogni tick: e' piccolo (<100KB tipicamente) e l'operazione
+        e' quasi istantanea su disco locale. In caso di errore di lettura
+        mostra il messaggio d'errore stesso nella box."""
+        try:
+            log_file = _error_logger._current_file()
+            if os.path.isfile(log_file):
+                with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                    raw = f.read()
+                txt = raw if raw.strip() else '(file vuoto)'
+            else:
+                txt = '(nessun log oggi)'
+            if self._errlog_box.text != txt:
+                self._errlog_box.text = txt
+                # Scorri alla fine (righe piu' recenti)
+                self._errlog_box.cursor = (len(txt), 0)
+        except Exception as e:
+            pass
 
     def _refresh_errlog_status(self):
         """Aggiorna lo stato passivo del log errori (conteggio + ultimo).
@@ -6880,8 +6988,27 @@ class SettingsScreen(TabScreen):
         super().tick(dt)
         if self.dm.connected: self._conn.text='Connesso'; self._conn.color=GREEN
         else: self._conn.text='Non connesso'; self._conn.color=RED
-        # Aggiorna la textbox diagnostica in tempo reale (ogni 1s)
+        # Aggiorna textbox diagnostica a destra
         self._refresh_diag()
+        # Aggiorna textbox NMEA log a sinistra
+        self._refresh_nmea_log()
+
+    def _refresh_nmea_log(self):
+        """Aggiorna la textbox NMEA con le ultime righe del ring buffer.
+        Mostra le righe piu' recenti in fondo (stile terminale).
+        Scorre automaticamente alla fine dopo l'aggiornamento."""
+        try:
+            lines = list(self.dm.nmea_log)  # snapshot thread-safe
+            if not lines:
+                txt = '(nessun dato ricevuto)'
+            else:
+                txt = '\n'.join(lines)
+            if self._nmea_log_box.text != txt:
+                self._nmea_log_box.text = txt
+                # Scorri alla fine: cursor alla fine del testo
+                self._nmea_log_box.cursor = (len(txt), 0)
+        except Exception as e:
+            pass
 
 # =============================================================================
 # APP
