@@ -4086,20 +4086,7 @@ class StartLineScreen(TabScreen):
         # insieme alla schermata Logging. Il tablet non scrive piu' tracks CSV
         # ne' fa upload al cloud. Per registrare i log delle uscite usa il
         # plotter di bordo o un'altra app dedicata.
-        # LOG NMEA: textbox nera read-only con le ultime righe ricevute
-        left.add_widget(Label(text='NMEA LOG',font_size=sp(18),color=ACCENT,
-                               bold=True,size_hint_y=None,height=dp(36)))
-        self._nmea_log_box = TextInput(
-            text='(nessun dato ricevuto)',
-            readonly=True,
-            multiline=True,
-            font_size=sp(11),
-            background_color=(0, 0, 0, 1),
-            foreground_color=GREEN,
-            cursor_color=(0, 0, 0, 0),
-            size_hint=(1, 1),
-        )
-        left.add_widget(self._nmea_log_box)
+        left.add_widget(Widget())
         self._cols.add_widget(left)
 
         right=BoxLayout(orientation='vertical',spacing=dp(8),
@@ -4646,9 +4633,7 @@ class WaypointsScreen(TabScreen):
         _bg(right,PANEL)
         right.add_widget(Label(text='AZIONI',font_size=sp(16),color=ACCENT,
                                 bold=True,size_hint_y=None,height=dp(32)))
-        for txt,fn in [('Aggiungi',     self._add),
-                        ('Modifica',     self._edit),
-                        ('Imposta boa',  self._set_mark),
+        for txt,fn in [('Imposta boa',  self._set_mark),
                         ('Rimuovi',      self._del),
                         ('Carica da file', self._reload_from_file),
                         ('Scarica da web', self._download_from_web)]:
@@ -4682,6 +4667,22 @@ class WaypointsScreen(TabScreen):
         try: Clock.schedule_once(lambda dt:self._map.redraw(),0)
         except: pass
 
+    @staticmethod
+    def _fmt_dm(val, is_lat):
+        """Formatta una coordinata in DD°MM.MMM'H.
+        Accetta sia float decimale sia stringa gia' formattata
+        (es. "45\u00b046.154'N") che viene restituita invariata."""
+        if val is None:
+            return '??'
+        if isinstance(val, str):
+            return val.strip()  # gia' formattata: usa com'e'
+        # float decimale -> DD°MM.MMM'H
+        hemi = ('N' if val >= 0 else 'S') if is_lat else ('E' if val >= 0 else 'W')
+        d = abs(val)
+        deg = int(d)
+        mins = (d - deg) * 60.0
+        return f"{deg}\u00b0{mins:06.3f}'{hemi}"
+
     def _refresh(self):
         self._lb.clear_widgets()
         self._mark.text = self.dm.target_mark or '--'
@@ -4703,12 +4704,10 @@ class WaypointsScreen(TabScreen):
                 marker = '  '
             side = wpt.get('side', 'port')
             side_lbl = 'SX' if side == 'port' else 'DX'
-            # Padding iniziale di 2 spazi non basta su display larghi: il
-            # testo viene allineato a sinistra dal Button ma se halign='left'
-            # senza padding visuale risulta incollato al bordo. Aggiungo
-            # spazi e uso text_size con margine per evitare il taglio.
+            lat_s = self._fmt_dm(wpt.get('lat'), is_lat=True)
+            lon_s = self._fmt_dm(wpt.get('lon'), is_lat=False)
             txt = (f"   {marker}{name}    "
-                   f"{wpt.get('lat',0):.4f}  {wpt.get('lon',0):.4f}   "
+                   f"{lat_s}  {lon_s}   "
                    f"[{side_lbl}]")
             # Evidenzia in arancio se selezionato
             is_sel = (self._sel is wpt)
@@ -4737,185 +4736,6 @@ class WaypointsScreen(TabScreen):
         """Selezione waypoint: aggiorna evidenziazione."""
         self._sel = wpt
         self._refresh()
-
-    # ---- Dialog inserimento/modifica ----
-
-    def _open_dialog(self, wpt=None):
-        """Apre il popup di inserimento/modifica.
-        Se wpt is None: nuovo waypoint (precompila lat/lon con GPS attuale).
-        Se wpt e' un dict: modifica del waypoint esistente."""
-
-        def _fmt_dm(deg, is_lat):
-            """Formatta gradi decimali in stringa DM: GG MM.mmm H.
-            Es. 45.752733, is_lat=True -> "45 45.164 N"."""
-            if deg is None:
-                return ''
-            if is_lat:
-                hemi = 'N' if deg >= 0 else 'S'
-            else:
-                hemi = 'E' if deg >= 0 else 'W'
-            d = abs(deg)
-            deg_int = int(d)
-            minutes = (d - deg_int) * 60.0
-            return f"{deg_int} {minutes:.3f} {hemi}"
-
-        is_new = wpt is None
-        if is_new:
-            # Nome di default progressivo, lat/lon dalla posizione GPS corrente
-            # in formato gradi-minuti decimali (DM): GG MM.mmm H.
-            init_name = f'WPT{len(self.dm.waypoints)+1}'
-            init_lat  = _fmt_dm(self.dm.gps_lat, True)  if self.dm.gps_lat else ''
-            init_lon  = _fmt_dm(self.dm.gps_lon, False) if self.dm.gps_lon else ''
-            init_side = 'port'
-            title = 'Nuovo waypoint'
-        else:
-            init_name = str(wpt.get('name',''))
-            init_lat  = _fmt_dm(wpt.get('lat'), True)
-            init_lon  = _fmt_dm(wpt.get('lon'), False)
-            init_side = wpt.get('side','port')
-            title = f"Modifica: {wpt.get('name','?')}"
-
-        # Layout del popup
-        content = BoxLayout(orientation='vertical', spacing=dp(8),
-                            padding=dp(10))
-
-        def _row(lbl_text, widget):
-            r = BoxLayout(orientation='horizontal', spacing=dp(8),
-                          size_hint_y=None, height=dp(54))
-            r.add_widget(Label(text=lbl_text, font_size=sp(18), color=MUTED,
-                               size_hint_x=0.30, halign='right',
-                               valign='middle'))
-            r.add_widget(widget)
-            return r
-
-        # Campo Nome
-        inp_name = TextInput(text=init_name, multiline=False,
-                             font_size=sp(18), size_hint_y=None, height=dp(54))
-        # Campo Latitudine
-        inp_lat = TextInput(text=init_lat, multiline=False, input_type='text',
-                            font_size=sp(18), size_hint_y=None, height=dp(54))
-        # Campo Longitudine
-        inp_lon = TextInput(text=init_lon, multiline=False, input_type='text',
-                            font_size=sp(18), size_hint_y=None, height=dp(54))
-
-        # Toggle Sinistra/Destra (mutually exclusive)
-        side_row = BoxLayout(orientation='horizontal', spacing=dp(8),
-                             size_hint_y=None, height=dp(54))
-        side_row.add_widget(Label(text='Lascia a:', font_size=sp(18),
-                                  color=MUTED, size_hint_x=0.30,
-                                  halign='right', valign='middle'))
-        # Lista mutabile per chiusura
-        cur_side = [init_side]
-        btn_sx = Button(text='SINISTRA', font_size=sp(16), bold=True,
-                        background_normal='')
-        btn_dx = Button(text='DESTRA',  font_size=sp(16), bold=True,
-                        background_normal='')
-
-        def _refresh_side_btns():
-            if cur_side[0] == 'port':
-                btn_sx.background_color = GREEN
-                btn_sx.color = (0, 0, 0, 1)
-                btn_dx.background_color = BTN_GRAY
-                btn_dx.color = WHITE
-            else:
-                btn_sx.background_color = BTN_GRAY
-                btn_sx.color = WHITE
-                btn_dx.background_color = RED
-                btn_dx.color = (0, 0, 0, 1)
-
-        def _set_sx(_):
-            cur_side[0] = 'port';      _refresh_side_btns()
-        def _set_dx(_):
-            cur_side[0] = 'starboard'; _refresh_side_btns()
-
-        btn_sx.bind(on_release=_set_sx)
-        btn_dx.bind(on_release=_set_dx)
-        _refresh_side_btns()
-        side_row.add_widget(btn_sx)
-        side_row.add_widget(btn_dx)
-
-        # Etichetta errori
-        err_lbl = Label(text='', font_size=sp(14), color=RED,
-                        size_hint_y=None, height=dp(28))
-
-        # Bottoniera OK / Annulla
-        btn_row = BoxLayout(orientation='horizontal', spacing=dp(8),
-                            size_hint_y=None, height=dp(54))
-
-        # Aggiungi tutti i widget. I campi accettano gradi-minuti decimali
-        # nel formato: GG MM.mmm H  (es. 45°45.164'N oppure 45 45.164 N).
-        # H = N/S per latitudine, E/W per longitudine. Senza emisfero il
-        # segno e' positivo.
-        content.add_widget(_row('Nome:', inp_name))
-        content.add_widget(_row("Lat (GG MM.mmm N/S):",  inp_lat))
-        content.add_widget(_row("Lon (GG MM.mmm E/W):", inp_lon))
-        content.add_widget(side_row)
-        content.add_widget(err_lbl)
-        content.add_widget(Widget())  # spacer
-        content.add_widget(btn_row)
-
-        popup = Popup(title=title, content=content,
-                      size_hint=(0.75, 0.85), auto_dismiss=False)
-
-        def _on_ok(_):
-            # Validazione campi
-            name = inp_name.text.strip()
-            if not name:
-                err_lbl.text = 'Nome obbligatorio'
-                return
-            try:
-                lat = parse_coord(inp_lat.text, is_lat=True)
-            except ValueError as e:
-                err_lbl.text = f'Lat non valida: {e}'
-                return
-            try:
-                lon = parse_coord(inp_lon.text, is_lat=False)
-            except ValueError as e:
-                err_lbl.text = f'Lon non valida: {e}'
-                return
-
-            # Persistenza FILE-FIRST: la modifica viene scritta direttamente
-            # su waypoints.json e poi self.dm.waypoints viene ricaricato dal
-            # file. Cosi' la fonte di verita' resta sempre il file.
-            if is_new:
-                ok, err = self.dm.waypoint_add(name, lat, lon, cur_side[0])
-            else:
-                old_name = wpt.get('name', '')
-                ok, err = self.dm.waypoint_update(old_name, name, lat, lon,
-                                                   cur_side[0])
-            if not ok:
-                err_lbl.text = err or 'Errore non specificato'
-                return
-
-            # Dopo la ricarica, ritrovo il waypoint per nome per aggiornare
-            # la selezione (i riferimenti vecchi non valgono piu')
-            self._sel = next((w for w in self.dm.waypoints
-                              if w.get('name') == name), None)
-            popup.dismiss()
-            self._refresh()
-
-        def _on_cancel(_):
-            popup.dismiss()
-
-        btn_ok     = mk_btn('OK',      _on_ok,     sp(18))
-        btn_cancel = mk_btn_gray('Annulla', _on_cancel, sp(18))
-        btn_row.add_widget(btn_cancel)
-        btn_row.add_widget(btn_ok)
-
-        popup.open()
-
-    def _add(self):
-        """Apre il dialog per inserire un nuovo waypoint."""
-        self._open_dialog(wpt=None)
-
-    def _edit(self):
-        """Apre il dialog per modificare il waypoint selezionato."""
-        if not self._sel:
-            Popup(title='Modifica',
-                  content=Label(text='Seleziona prima un waypoint dalla lista.'),
-                  size_hint=(0.45, 0.22)).open()
-            return
-        self._open_dialog(wpt=self._sel)
 
     def _set_mark(self):
         """Imposta il waypoint selezionato come boa attiva (target_mark).
@@ -6640,13 +6460,13 @@ class SettingsScreen(TabScreen):
         left.add_widget(twd_row)
         self._refresh_twd_buttons()
 
-        # PERCORSI FILE: pulsanti utility, niente preview path (vedi "Mostra path completo")
+        # CONFIGURAZIONE: label header (pulsanti spostati in colonna destra UTILITY)
         left.add_widget(Label(text='CONFIGURAZIONE',font_size=sp(18),color=ACCENT,
                                bold=True,size_hint_y=None,height=dp(36)))
-        sv_row=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(70))
-        sv_row.add_widget(mk_btn_gray('Salva configurazione', self._save_cfg,    sp(18)))
-        sv_row.add_widget(mk_btn_gray('Path default',         self._reset_paths, sp(18)))
-        left.add_widget(sv_row)
+        left.add_widget(Label(
+            text='Modifica sailing_config.json per parametri cloud e path.',
+            font_size=sp(13),color=MUTED,size_hint_y=None,height=dp(36),
+            halign='left',valign='middle'))
 
         # NOTA: la sezione Azure Blob e' stata rimossa dalla UI per richiesta
         # utente. Tutti i parametri sono editabili SOLO via sailing_config.json.
@@ -6655,98 +6475,38 @@ class SettingsScreen(TabScreen):
         #   - blob_base        = 'https://sailingapp.blob.core.windows.net'
         #   - blob_account_key = chiave master dello storage account
 
-        left.add_widget(Widget())
-        self._cols.add_widget(left)
-
-        # COLONNA DESTRA: diagnostica inline + utility
-        info=BoxLayout(orientation='vertical',spacing=dp(8),
-                        padding=dp(14),size_hint_x=0.45)
-        _bg(info,PANEL)
-        info.add_widget(Label(text='DIAGNOSTICA',font_size=sp(18),color=ACCENT,
-                               bold=True,size_hint_y=None,height=dp(36)))
-
-        # TextBox read-only scrollabile: mostra path, NMEA status, valori in
-        # memoria. Si aggiorna ad ogni tick (schermata attiva) e via "Aggiorna".
-        self._diag_box = TextInput(
-            text='',
+        # NMEA LOG: textbox nera con le ultime righe NMEA ricevute
+        left.add_widget(Label(text='NMEA LOG', font_size=sp(18), color=ACCENT,
+                               bold=True, size_hint_y=None, height=dp(36)))
+        self._nmea_log_box = TextInput(
+            text='(nessun dato ricevuto)',
             readonly=True,
             multiline=True,
             font_size=sp(11),
-            background_color=(0.04, 0.08, 0.16, 1),
-            foreground_color=WHITE,
-            cursor_color=(0, 0, 0, 0),  # cursore invisibile (read-only)
+            background_color=(0, 0, 0, 1),
+            foreground_color=GREEN,
+            cursor_color=(0, 0, 0, 0),
             size_hint=(1, 1),
         )
-        info.add_widget(self._diag_box)
+        left.add_widget(self._nmea_log_box)
+        self._cols.add_widget(left)
 
-        # Pulsanti sotto la textbox
-        btn_row=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
-        btn_row.add_widget(mk_btn_gray('Aggiorna',  self._refresh_diag,            sp(14)))
-        btn_row.add_widget(mk_btn_gray('Ric. conf', self._reload_cfg,              sp(14)))
-        btn_row.add_widget(mk_btn_gray('Cloud cfg', self._download_cfg_from_cloud, sp(14)))
-        info.add_widget(btn_row)
+        # COLONNA DESTRA: utility
+        info=BoxLayout(orientation='vertical',spacing=dp(8),
+                        padding=dp(14),size_hint_x=0.45)
+        _bg(info,PANEL)
+        info.add_widget(Label(text='UTILITY',font_size=sp(18),color=ACCENT,
+                               bold=True,size_hint_y=None,height=dp(36)))
+        for txt,fn in [('Ric. conf',  self._reload_cfg),
+                        ('Cloud cfg',  self._download_cfg_from_cloud),
+                        ('Salva tutto', self._save_cfg),
+                        ('Path default', self._reset_paths)]:
+            info.add_widget(mk_btn_gray(txt, fn, sp(16)))
+        info.add_widget(Widget())
         self._cols.add_widget(info)
-
-        # Prima populate
-        self._refresh_diag()
 
     def _do_resize(self,dt): pass
 
-    def _build_diag_text(self):
-        """Costruisce il testo diagnostico da mostrare nella textbox a destra.
-        Chiamato da _refresh_diag (pulsante) e da tick (aggiornamento live)."""
-        dm = self.dm
-        cfg_size = '?'
-        cfg_raw = '(non trovato)'
-        try:
-            if os.path.isfile(dm.config_path):
-                cfg_size = f'{os.path.getsize(dm.config_path)}B'
-                with open(dm.config_path) as f:
-                    cfg_raw = f.read()
-        except Exception as e:
-            cfg_raw = f'(err: {e})'
-        wpts_status = (f'{os.path.getsize(WAYPOINTS_PATH)}B'
-                       if os.path.isfile(WAYPOINTS_PATH) else '(assente)')
-        bid_disp  = dm.cloud_boat_id or '(VUOTO)'
-        key_disp  = 'si' if dm.blob_account_key else 'NO'
-        pynmea2_ok = 'OK' if HAS_PYNMEA2 else '*** MANCANTE ***'
-        recv_alive = (dm.recv_thread is not None and dm.recv_thread.is_alive())
-        recv_s = ('vivo' if recv_alive
-                  else 'mai avviato' if dm.recv_thread is None
-                  else '*** MORTO ***')
-        conn_s = 'SI' if dm.connected else 'no'
-        ts = datetime.now().strftime('%H:%M:%S')
-        return (
-            f"[{ts}]\n"
-            f"\n--- NMEA ---\n"
-            f"pynmea2  : {pynmea2_ok}\n"
-            f"connected: {conn_s}\n"
-            f"thread   : {recv_s}\n"
-            f"server   : {dm.nmea_ip}:{dm.nmea_port}\n"
-            f"\n--- CONFIG ---\n"
-            f"file     : {cfg_size}\n"
-            f"TWD win  : {dm.twd_window_minutes}m\n"
-            f"Cloud    : {'ON' if dm.cloud_enabled else 'off'} {dm.cloud_interval_s}s\n"
-            f"BoatID   : {bid_disp}\n"
-            f"EventHub : {'si' if dm.eventhub_connection_string else 'NO'}\n"
-            f"AccKey   : {key_disp}\n"
-            f"Waypts   : {len(dm.waypoints)}\n"
-            f"Boa att. : {dm.target_mark or '(nessuna)'}\n"
-            f"\n--- PATH ---\n"
-            f"cfg : {dm.config_path}\n"
-            f"pol : {dm.polar_path}\n"
-            f"wpt : {WAYPOINTS_PATH} ({wpts_status})\n"
-            f"log : {dm.log_dir}\n"
-            f"\n--- SAILING_CONFIG.JSON ---\n"
-            f"{cfg_raw}"
-        )
-
-    def _refresh_diag(self):
-        """Aggiorna la textbox diagnostica (pulsante Aggiorna o tick)."""
-        try:
-            self._diag_box.text = self._build_diag_text()
-        except Exception as e:
-            self._diag_box.text = f'Errore diagnostica: {e}'
 
 
     def _reload_cfg(self):
@@ -6988,9 +6748,7 @@ class SettingsScreen(TabScreen):
         super().tick(dt)
         if self.dm.connected: self._conn.text='Connesso'; self._conn.color=GREEN
         else: self._conn.text='Non connesso'; self._conn.color=RED
-        # Aggiorna textbox diagnostica a destra
-        self._refresh_diag()
-        # Aggiorna textbox NMEA log a sinistra
+        # Aggiorna NMEA log
         self._refresh_nmea_log()
 
     def _refresh_nmea_log(self):
