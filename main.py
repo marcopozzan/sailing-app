@@ -3126,6 +3126,105 @@ class DataManager:
             sails_info = f' + crossover ({n_def} vele)'
         return (True, f'Polare "{boat}" scaricata ({n_tws} TWS x {n_twa} TWA){sails_info}')
 
+    def list_polar_blobs(self, timeout=10):
+        """Elenca i file .json nel container polars/{boat_id}/ del blob storage.
+        Stessa logica di list_waypoint_blobs(). Restituisce (ok, items_or_error)."""
+        base  = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
+        boat  = (self.cloud_boat_id or '').strip()
+        if not boat:
+            return False, 'cloud_boat_id non configurato'
+        has_key = bool((getattr(self, 'blob_account_key', '') or '').strip())
+        has_sas = bool((getattr(self, 'blob_sas_token',   '') or '').strip())
+        if not (has_key or has_sas):
+            return False, 'Nessuna credenziale blob configurata'
+        from urllib.parse import quote
+        prefix   = quote(f'{boat}/', safe='/')
+        list_url = (f'{base}/{BLOB_CONTAINER_POLARS}'
+                    f'?restype=container&comp=list&prefix={prefix}')
+        try:
+            req = urllib.request.Request(list_url, method='GET',
+                                         headers={'x-ms-version': '2020-04-08'})
+            authorize_blob_request(req, self)
+            with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
+                raw_xml = resp.read().decode('utf-8', errors='replace')
+        except Exception as e:
+            return False, f'Errore connessione: {type(e).__name__}: {e}'
+        import re
+        items = []
+        for blob_block in re.findall(r'<Blob>(.*?)</Blob>', raw_xml, re.DOTALL):
+            name_m = re.search(r'<Name>(.*?)</Name>', blob_block)
+            size_m = re.search(r'<Content-Length>(.*?)</Content-Length>', blob_block)
+            date_m = re.search(r'<Last-Modified>(.*?)</Last-Modified>', blob_block)
+            if not name_m:
+                continue
+            blob_name = name_m.group(1).strip()
+            if not blob_name.lower().endswith('.json'):
+                continue
+            file_size = size_m.group(1).strip() if size_m else '?'
+            last_mod  = date_m.group(1).strip() if date_m else ''
+            date_short = ''
+            dm_match = re.search(r'\d{2} \w{3} \d{4}', last_mod)
+            if dm_match:
+                date_short = dm_match.group(0)
+            display  = blob_name.split('/')[-1]
+            file_url = f'{base}/{BLOB_CONTAINER_POLARS}/{blob_name}'
+            items.append({'blob_name': blob_name, 'display': display,
+                          'url': file_url, 'size': file_size, 'date': date_short})
+        if not items:
+            return False, 'Nessun file .json trovato nel container polars'
+        return True, items
+
+    def download_polar_from_url(self, url, timeout=15):
+        """Scarica una polare da un URL arbitrario (Azure Blob) e sovrascrive
+        self.polar_path. Ricarica la polare in memoria. Restituisce (ok, msg)."""
+        try:
+            req = urllib.request.Request(url, method='GET',
+                                         headers={'x-ms-version': '2020-04-08'})
+            authorize_blob_request(req, self)
+            with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
+                raw = resp.read()
+        except Exception as e:
+            return False, f'Download fallito: {type(e).__name__}: {e}'
+        try:
+            data = json.loads(raw.decode('utf-8', errors='replace'))
+        except Exception as e:
+            return False, f'JSON non valido: {e}'
+        # Validazione struttura polare
+        if not isinstance(data, dict):
+            return False, 'Formato JSON inatteso (atteso oggetto)'
+        polar_dict = data.get('polar')
+        if not isinstance(polar_dict, dict) or not polar_dict:
+            return False, 'Campo "polar" mancante o vuoto'
+        try:
+            any_tws = next(iter(polar_dict))
+            any_twa_d = polar_dict[any_tws]
+            any_twa = next(iter(any_twa_d))
+            float(any_tws); float(any_twa); float(any_twa_d[any_twa])
+        except Exception as e:
+            return False, f'Struttura polare non valida: {e}'
+        # Salvataggio atomico (sovrascrive il file locale)
+        try:
+            parent = os.path.dirname(self.polar_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = self.polar_path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                try: os.fsync(f.fileno())
+                except: pass
+            os.replace(tmp, self.polar_path)
+        except Exception as e:
+            return False, f'Errore salvataggio: {e}'
+        if not self.polar.load(self.polar_path):
+            return False, 'File salvato ma ricaricamento polare fallito'
+        self.polar_enabled = True
+        self.save_cfg_safe()
+        boat  = self.polar.boat_name or '(senza nome)'
+        n_tws = len(self.polar.get_tws_list())
+        n_twa = len(self.polar.get_twa_list())
+        return True, f'Polare "{boat}" ({n_tws} TWS × {n_twa} TWA)'
+
     # Nota: i metodi upload_waypoints_to_cloud/upload_polar_to_cloud/_put_blob
     # sono stati rimossi nella v1.12 (pulsanti UI eliminati). Idem TrackLogger
     # e TrackUploader e relative funzioni sono stati rimossi nella v1.17
@@ -4526,6 +4625,126 @@ class LayLineScreen(TabScreen):
 # 4 -- WAYPOINTS
 # =============================================================================
 
+def _make_blob_picker_popup(title, list_fn, download_fn, on_success, dm):
+    """Factory che costruisce un popup blob-picker generico a due fasi.
+
+    Parametri:
+      title       : titolo del Popup
+      list_fn     : callable() -> (ok, items_or_err)  [chiama DataManager.list_*_blobs]
+      download_fn : callable(url) -> (ok, msg)         [chiama DataManager.download_*_from_url]
+      on_success  : callable() -> None                 [aggiorna la UI dopo download OK]
+      dm          : DataManager (per cloud_boat_id check)
+
+    Il popup viene aperto dalla factory. Non restituisce nulla.
+    """
+    # Popup root
+    root = BoxLayout(orientation='vertical', spacing=dp(6), padding=dp(10))
+
+    status_lbl = Label(
+        text='Connessione al cloud...\nAttendere.',
+        font_size=sp(16), color=MUTED,
+        size_hint_y=None, height=dp(56),
+        halign='center', valign='middle')
+    status_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
+    root.add_widget(status_lbl)
+
+    sv = ScrollView(do_scroll_x=False, size_hint=(1, 1))
+    file_list = BoxLayout(orientation='vertical', spacing=dp(4), size_hint_y=None)
+    file_list.bind(minimum_height=file_list.setter('height'))
+    sv.add_widget(file_list)
+    root.add_widget(sv)
+
+    close_btn = Button(
+        text='Attendere...', disabled=True,
+        size_hint_y=None, height=dp(50),
+        background_color=BTN_GRAY, background_normal='',
+        color=WHITE, bold=True)
+    root.add_widget(close_btn)
+
+    pop = Popup(title=title, content=root,
+                size_hint=(0.88, 0.80), auto_dismiss=False)
+    close_btn.bind(on_release=lambda _: pop.dismiss())
+    pop.open()
+
+    def _enable_close(msg='', color=None):
+        if msg:
+            status_lbl.text = msg
+        if color:
+            status_lbl.color = color
+        close_btn.text     = 'Chiudi'
+        close_btn.disabled = False
+        pop.auto_dismiss   = True
+
+    def _do_download(item):
+        file_list.clear_widgets()
+        status_lbl.text  = f"Download di:\n{item['display']}\n\nAttendere..."
+        status_lbl.color = WHITE
+        close_btn.disabled = True
+        close_btn.text     = 'Attendere...'
+
+        def _worker():
+            try:
+                ok, msg = download_fn(item['url'])
+            except Exception as e:
+                ok, msg = False, f'{type(e).__name__}: {e}'
+
+            @mainthread
+            def _finish():
+                if ok:
+                    try:
+                        on_success()
+                    except Exception as e:
+                        log_err('blob_picker on_success', exc=e)
+                    _enable_close(
+                        f'✓ {msg}\nFile: {item["display"]}',
+                        GREEN)
+                else:
+                    _enable_close(f'✗ Errore:\n{msg}', RED)
+            _finish()
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_list(items):
+        file_list.clear_widgets()
+        status_lbl.text  = f'{len(items)} file trovati — scegli:'
+        status_lbl.color = WHITE
+        for item in items:
+            try:
+                size_str = f"  {int(item['size'])//1024}KB" if item.get('size','?') != '?' else ''
+            except Exception:
+                size_str = ''
+            label_txt = item['display'] + size_str
+            if item.get('date'):
+                label_txt += f"\n{item['date']}"
+            btn = Button(
+                text=label_txt,
+                font_size=sp(16), size_hint_y=None, height=dp(64),
+                background_color=SIDEBAR, background_normal='',
+                color=WHITE, halign='left', valign='middle',
+                padding=(dp(12), dp(4)))
+            btn.text_size = (Window.width * 0.78, None)
+            btn.bind(on_release=lambda _, i=item: _do_download(i))
+            file_list.add_widget(btn)
+        close_btn.text     = 'Annulla'
+        close_btn.disabled = False
+        pop.auto_dismiss   = True
+
+    def _list_worker():
+        try:
+            ok, result = list_fn()
+        except Exception as e:
+            ok, result = False, f'{type(e).__name__}: {e}'
+
+        @mainthread
+        def _update():
+            if ok:
+                _show_list(result)
+            else:
+                _enable_close(f'✗ Impossibile listare i file:\n{result}', RED)
+        _update()
+
+    threading.Thread(target=_list_worker, daemon=True).start()
+
+
 class WaypointMapWidget(Widget):
     """Mini-mappa per la schermata WPT: disegna i waypoint nell'ordine in cui
     sono in self.dm.waypoints, li collega con linee (rotta), evidenzia la boa
@@ -4784,10 +5003,9 @@ class WaypointsScreen(TabScreen):
         _bg(right,PANEL)
         right.add_widget(Label(text='AZIONI',font_size=sp(16),color=ACCENT,
                                 bold=True,size_hint_y=None,height=dp(32)))
-        for txt,fn in [('Imposta boa',  self._set_mark),
-                        ('Rimuovi',      self._del),
-                        ('Carica da file', self._reload_from_file),
-                        ('Scarica da web', self._download_from_web)]:
+        for txt,fn in [('Imposta boa iniziale', self._set_mark),
+                        ('Carica da file',       self._reload_from_file),
+                        ('Scarica da cloud',     self._download_from_web)]:
             right.add_widget(mk_btn(txt,fn,sp(18)))
         right.add_widget(Label(text='BOA ATTIVA',font_size=sp(16),color=ACCENT,
                                 bold=True,size_hint_y=None,height=dp(32)))
@@ -4948,16 +5166,9 @@ class WaypointsScreen(TabScreen):
                   size_hint=(0.5, 0.25)).open()
 
     def _download_from_web(self):
-        """Picker blob in due fasi:
-        1. Mostra popup 'Caricamento lista...' e chiama list_waypoint_blobs()
-           in thread (non blocca UI).
-        2. Se la lista arriva, mostra i file come pulsanti selezionabili
-           nel popup stesso (riusa lo stesso container, niente nuovo Popup).
-        3. Al click su un file, avvia il download in thread e aggiorna lo
-           stato nel popup. Pulsante Chiudi abilitato solo a fine operazione.
-        """
-        dm = self.dm
-        if not dm.cloud_boat_id:
+        """Apre il picker blob per il container waypoints/. Sovrascrive
+        automaticamente il file waypoints.json locale al download."""
+        if not self.dm.cloud_boat_id:
             Popup(title='Scarica da cloud',
                   content=Label(text='cloud_boat_id non configurato.\n'
                                      'Imposta in sailing_config.json.',
@@ -4965,125 +5176,25 @@ class WaypointsScreen(TabScreen):
                   size_hint=(0.6, 0.28)).open()
             return
 
-        # ── Costruzione popup (una volta sola, non modificato strutturalmente) ──
-        root = BoxLayout(orientation='vertical', spacing=dp(6), padding=dp(10))
-
-        status_lbl = Label(
-            text='Connessione al cloud...\nAttendere.',
-            font_size=sp(16), color=MUTED,
-            size_hint_y=None, height=dp(56),
-            halign='center', valign='middle')
-        status_lbl.bind(size=lambda l,_: setattr(l,'text_size',l.size))
-        root.add_widget(status_lbl)
-
-        # ScrollView per la lista file (inizialmente vuota)
-        sv = ScrollView(do_scroll_x=False, size_hint=(1,1))
-        file_list = BoxLayout(orientation='vertical', spacing=dp(4),
-                               size_hint_y=None)
-        file_list.bind(minimum_height=file_list.setter('height'))
-        sv.add_widget(file_list)
-        root.add_widget(sv)
-
-        close_btn = Button(
-            text='Attendere...', disabled=True,
-            size_hint_y=None, height=dp(50),
-            background_color=BTN_GRAY, background_normal='',
-            color=WHITE, bold=True)
-        root.add_widget(close_btn)
-
-        pop = Popup(title='Scarica percorso dal cloud',
-                    content=root, size_hint=(0.88, 0.80),
-                    auto_dismiss=False)
-        close_btn.bind(on_release=lambda _: pop.dismiss())
-        pop.open()
-
-        def _enable_close(msg='', color=None):
-            status_lbl.text     = msg or status_lbl.text
-            if color: status_lbl.color = color
-            close_btn.text      = 'Chiudi'
-            close_btn.disabled  = False
-            pop.auto_dismiss    = True
-
-        def _do_download(item):
-            """Avvia download del file selezionato."""
-            file_list.clear_widgets()
-            status_lbl.text  = f"Download di:\n{item['display']}\n\nAttendere..."
-            status_lbl.color = WHITE
-            close_btn.disabled = True
-            close_btn.text     = 'Attendere...'
-
-            def _worker():
-                try:
-                    ok, msg = dm.download_waypoints_from_url(item['url'])
-                except Exception as e:
-                    ok, msg = False, f'{type(e).__name__}: {e}'
-                @mainthread
-                def _finish():
-                    if ok:
-                        # Aggiorna UI waypoint
-                        try:
-                            if dm.target_mark and not any(
-                                    w.get('name')==dm.target_mark
-                                    for w in dm.waypoints):
-                                dm.target_mark = None
-                                dm._reset_mark_pass_state()
-                                dm.save_cfg_safe()
-                            self._sel = None
-                            self._refresh()
-                        except Exception as e:
-                            log_err('_download_from_web finish refresh', exc=e)
-                        _enable_close(
-                            f"✓ {msg}\nFile: {item['display']}\n\n"
-                            f"Waypoint caricati: {len(dm.waypoints)}",
-                            GREEN)
-                    else:
-                        _enable_close(f"✗ Errore:\n{msg}", RED)
-                _finish()
-            threading.Thread(target=_worker, daemon=True).start()
-
-        def _show_list(items):
-            """Popola la ScrollView con i file trovati."""
-            file_list.clear_widgets()
-            status_lbl.text  = f'{len(items)} file trovati — scegli il percorso:'
-            status_lbl.color = WHITE
-            for item in items:
-                size_kb = ''
-                try:
-                    size_kb = f"  {int(item['size'])//1024}KB" if item['size'] != '?' else ''
-                except Exception:
-                    pass
-                label_txt = f"{item['display']}{size_kb}"
-                if item.get('date'):
-                    label_txt += f"\n{item['date']}"
-                btn = Button(
-                    text=label_txt,
-                    font_size=sp(16),
-                    size_hint_y=None, height=dp(64),
-                    background_color=SIDEBAR, background_normal='',
-                    color=WHITE, halign='left', valign='middle',
-                    padding=(dp(12), dp(4)))
-                btn.text_size = (Window.width * 0.78, None)
-                btn.bind(on_release=lambda _, i=item: _do_download(i))
-                file_list.add_widget(btn)
-            _enable_close()  # abilita Chiudi anche se non si seleziona nulla
-            # Non disabilitare subito: l'utente potrebbe voler solo vedere la lista
-            close_btn.disabled = False
-            close_btn.text = 'Annulla'
-
-        def _list_worker():
+        def _on_success():
             try:
-                ok, result = dm.list_waypoint_blobs()
+                if self.dm.target_mark and not any(
+                        w.get('name') == self.dm.target_mark
+                        for w in self.dm.waypoints):
+                    self.dm.target_mark = None
+                    self.dm._reset_mark_pass_state()
+                    self.dm.save_cfg_safe()
+                self._sel = None
+                self._refresh()
             except Exception as e:
-                ok, result = False, f'{type(e).__name__}: {e}'
-            @mainthread
-            def _update():
-                if ok:
-                    _show_list(result)
-                else:
-                    _enable_close(f"✗ Impossibile listare i file:\n{result}", RED)
-            _update()
+                log_err('wpt download on_success', exc=e)
 
-        threading.Thread(target=_list_worker, daemon=True).start()
+        _make_blob_picker_popup(
+            title       = 'Scarica percorso dal cloud',
+            list_fn     = self.dm.list_waypoint_blobs,
+            download_fn = self.dm.download_waypoints_from_url,
+            on_success  = _on_success,
+            dm          = self.dm)
 
 
 # =============================================================================
@@ -5157,7 +5268,7 @@ class PolarScreen(TabScreen):
                                 bold=True,size_hint_y=None,height=dp(32)))
         right.add_widget(mk_btn('Ricarica da file',
                                 self._reload_from_file, sp(18)))
-        right.add_widget(mk_btn('Scarica da web',
+        right.add_widget(mk_btn('Scarica da cloud',
                                 self._download_from_web, sp(18)))
         # Mostra il path da cui si carica (read-only, modificabile solo da
         # config.json). Cosi' l'utente sa esattamente quale file editare.
@@ -5269,67 +5380,31 @@ class PolarScreen(TabScreen):
             self._msg('Errore', f'File non valido:\n{path}')
 
     def _download_from_web(self):
-        """Scarica polar.json dal cloud blob storage e lo salva in self.dm.polar_path.
-
-        URL: {blob_base}/polars/{cloud_boat_id}/polar.json
-        Pattern UI bulletproof: stesso schema delle altre operazioni cloud."""
-        url = self.dm.download_polar_url()
-        if not url:
-            Popup(title='Scarica da web',
+        """Apre il picker blob per il container polars/. Sovrascrive
+        automaticamente il file polar.json locale (self.dm.polar_path)
+        e ricarica la polare in memoria."""
+        if not self.dm.cloud_boat_id:
+            Popup(title='Scarica da cloud',
                   content=Label(text='cloud_boat_id non configurato.\n'
-                                     'Imposta il valore in sailing_config.json',
+                                     'Imposta in sailing_config.json.',
                                 halign='center', valign='middle'),
-                  size_hint=(0.6, 0.30)).open()
+                  size_hint=(0.6, 0.28)).open()
             return
 
-        # Popup costruito UNA volta sola
-        box = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
-        status_lbl = Label(text=f'Scaricamento da:\n{url}\n\nAttendere...',
-                            halign='center', valign='middle', color=WHITE)
-        status_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        box.add_widget(status_lbl)
-        close_btn = Button(text='Attendere...',
-                            size_hint_y=None, height=dp(48),
-                            background_color=BTN_GRAY, background_normal='',
-                            color=WHITE, bold=True, disabled=True)
-        box.add_widget(close_btn)
-
-        pop = Popup(title='Scarica da web', content=box,
-                     size_hint=(0.80, 0.55), auto_dismiss=False)
-        close_btn.bind(on_release=lambda _: pop.dismiss())
-        pop.open()
-
-        def _finish(text, color, refresh_ui=False):
+        def _on_success():
             try:
-                if refresh_ui:
-                    self._refresh_table()
-                    self._refresh_enabled_btns()
-                status_lbl.text  = text
-                status_lbl.color = color
-                close_btn.text   = 'Chiudi'
-                close_btn.disabled = False
-                pop.auto_dismiss = True
+                self._refresh_table()
+                self._refresh_enabled_btns()
+                self._path_lbl.text = self._fmt_path()
             except Exception as e:
-                print(f'_download_from_web polar _finish: {e}')
+                log_err('polar download on_success', exc=e)
 
-        def _worker():
-            try:
-                ok, msg = self.dm.download_polar_from_web()
-                if ok:
-                    Clock.schedule_once(lambda dt: _finish(
-                        f'OK: {msg}\n\nFile salvato in:\n{self.dm.polar_path}',
-                        GREEN, refresh_ui=True), 0)
-                else:
-                    Clock.schedule_once(lambda dt, m=msg: _finish(
-                        f'Errore download:\n{m}', RED), 0)
-            except Exception as e:
-                import traceback
-                print(f'_download_from_web polar CRASH:\n{traceback.format_exc()}')
-                Clock.schedule_once(
-                    lambda dt, m=f'{type(e).__name__}: {e}': _finish(
-                        f'Errore inatteso:\n{m}', RED), 0)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        _make_blob_picker_popup(
+            title       = 'Scarica polare dal cloud',
+            list_fn     = self.dm.list_polar_blobs,
+            download_fn = self.dm.download_polar_from_url,
+            on_success  = _on_success,
+            dm          = self.dm)
 
     def _msg(self,t,m):
         Popup(title=t,content=Label(text=m),size_hint=(0.55,0.30)).open()
