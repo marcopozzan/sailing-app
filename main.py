@@ -2747,6 +2747,120 @@ class DataManager:
         base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
         return f'{base}/{BLOB_CONTAINER_WAYPOINTS}/{self.cloud_boat_id}/{WAYPOINTS_FILE}'
 
+    def list_waypoint_blobs(self, timeout=10):
+        """Elenca i file .json presenti nel container waypoints/ del blob storage.
+
+        Chiama Azure Blob REST API:
+          GET {blob_base}/waypoints?restype=container&comp=list&prefix={boat_id}/
+
+        Parsa la risposta XML cercando tutti i tag <Name>.
+        Restituisce (ok, items_or_error):
+          - ok=True  -> items e' una lista di dict {name, url, size, last_modified}
+          - ok=False -> items e' la stringa di errore
+        """
+        base = (self.blob_base or BLOB_BASE_DEFAULT).rstrip('/')
+        boat = (self.cloud_boat_id or '').strip()
+        if not boat:
+            return False, 'cloud_boat_id non configurato'
+        has_key = bool((getattr(self, 'blob_account_key', '') or '').strip())
+        has_sas = bool((getattr(self, 'blob_sas_token',   '') or '').strip())
+        if not (has_key or has_sas):
+            return False, 'Nessuna credenziale blob configurata (blob_account_key o blob_sas_token)'
+        from urllib.parse import quote
+        prefix = quote(f'{boat}/', safe='/')
+        list_url = (f'{base}/{BLOB_CONTAINER_WAYPOINTS}'
+                    f'?restype=container&comp=list&prefix={prefix}')
+        try:
+            req = urllib.request.Request(list_url, method='GET',
+                                         headers={'x-ms-version': '2020-04-08'})
+            authorize_blob_request(req, self)
+            with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
+                raw_xml = resp.read().decode('utf-8', errors='replace')
+        except Exception as e:
+            return False, f'Errore connessione: {type(e).__name__}: {e}'
+
+        # Parsing XML senza librerie (re + split: affidabile per questo formato)
+        import re
+        items = []
+        for blob_block in re.findall(r'<Blob>(.*?)</Blob>', raw_xml, re.DOTALL):
+            name_m = re.search(r'<Name>(.*?)</Name>', blob_block)
+            size_m = re.search(r'<Content-Length>(.*?)</Content-Length>', blob_block)
+            date_m = re.search(r'<Last-Modified>(.*?)</Last-Modified>', blob_block)
+            if not name_m:
+                continue
+            blob_name = name_m.group(1).strip()
+            # Mostra solo file .json (salta directory marker e altri tipi)
+            if not blob_name.lower().endswith('.json'):
+                continue
+            file_size = size_m.group(1).strip() if size_m else '?'
+            last_mod  = date_m.group(1).strip() if date_m else ''
+            # Data compatta: "Thu, 01 May 2025 10:23:00 GMT" -> "01 May 2025"
+            date_short = ''
+            dm = re.search(r'\d{2} \w{3} \d{4}', last_mod)
+            if dm:
+                date_short = dm.group(0)
+            display = blob_name.split('/')[-1]  # solo filename senza prefisso
+            file_url = f'{base}/{BLOB_CONTAINER_WAYPOINTS}/{blob_name}'
+            items.append({
+                'blob_name': blob_name,
+                'display':   display,
+                'url':       file_url,
+                'size':      file_size,
+                'date':      date_short,
+            })
+        if not items:
+            return False, 'Nessun file .json trovato nel container waypoints'
+        return True, items
+
+    def download_waypoints_from_url(self, url, timeout=15):
+        """Scarica un file waypoints da un URL arbitrario (Azure Blob).
+        Usato dal picker blob: l'URL e' gia' costruito da list_waypoint_blobs().
+        Restituisce (ok, msg)."""
+        try:
+            req = urllib.request.Request(url, method='GET',
+                                         headers={'x-ms-version': '2020-04-08'})
+            authorize_blob_request(req, self)
+            with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
+                raw = resp.read()
+        except Exception as e:
+            return False, f'Download fallito: {type(e).__name__}: {e}'
+        try:
+            data = json.loads(raw.decode('utf-8', errors='replace'))
+        except Exception as e:
+            return False, f'JSON non valido: {e}'
+        # Riusa la logica di validazione di download_waypoints_from_web
+        if isinstance(data, dict):
+            wpts = data.get('waypoints', [])
+        elif isinstance(data, list):
+            wpts = data
+        else:
+            return False, 'Formato JSON inatteso'
+        cleaned = []
+        for i, w in enumerate(wpts):
+            if not (isinstance(w, dict) and 'name' in w and 'lat' in w and 'lon' in w):
+                continue
+            side = str(w.get('side', 'port')).lower()
+            if side not in ('port', 'starboard'):
+                side = 'port'
+            try:
+                cleaned.append({
+                    'name': str(w['name']),
+                    'lat':  coord_in(w['lat'], is_lat=True),
+                    'lon':  coord_in(w['lon'], is_lat=False),
+                    'side': side,
+                })
+            except Exception:
+                continue
+        if not cleaned:
+            return False, 'Nessun waypoint valido nel file'
+        try:
+            self._write_waypoints_file(cleaned)
+        except Exception as e:
+            return False, f'Errore salvataggio: {e}'
+        self._load_waypoints_json()
+        return True, f'{len(cleaned)} waypoint scaricati'
+
+
     def download_polar_url(self):
         """URL completo da cui scaricare il file polar.json.
 
@@ -3608,26 +3722,43 @@ class DataManager:
         return True
 
     def connect(self,ip,port):
-        # FIX v1.18b: controlla se il recv thread e' ancora vivo prima di
-        # dichiarare "gia' connesso". Se il thread e' morto (es. socket error
-        # su Android) ma connected e' rimasto True, forziamo una riconnessione.
+        """Apre connessione TCP verso il server NMEA.
+        Thread-safe: controlla recv_thread.is_alive() prima di rientrare.
+        Timeout: 5s per non bloccare la UI troppo a lungo."""
         if self.connected:
             if self.recv_thread and self.recv_thread.is_alive():
                 return True
-            # Thread morto con connected=True: resettiamo per riconnetterci
-            print('connect: recv thread morto, forzo reconnect')
+            # Thread morto con connected=True: forza reconnect
+            log_err(f'connect: recv thread morto, forzo reconnect su {ip}:{port}')
             self.connected = False
             try:
                 if self.sock: self.sock.close()
-            except: pass
+            except Exception: pass
             self.sock = None
+        if not ip or not str(ip).strip():
+            log_err('connect: IP vuoto'); return False
         try:
-            self.sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-            self.sock.settimeout(5); self.sock.connect((ip,int(port)))
-            self.connected=True
-            self.recv_thread=threading.Thread(target=self._recv,daemon=True)
-            self.recv_thread.start(); return True
-        except Exception as e: print(f'Conn:{e}'); self.connected=False; return False
+            port = int(port)
+        except (TypeError, ValueError):
+            log_err(f'connect: porta non valida {port!r}'); return False
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self.sock.settimeout(5)
+            self.sock.connect((str(ip).strip(), port))
+            self.sock.settimeout(2)  # recv timeout piu' corto post-connect
+            self.connected = True
+            self.recv_thread = threading.Thread(target=self._recv, daemon=True)
+            self.recv_thread.start()
+            return True
+        except Exception as e:
+            log_err(f'connect {ip}:{port}', exc=e)
+            self.connected = False
+            try:
+                if self.sock: self.sock.close()
+            except Exception: pass
+            self.sock = None
+            return False
 
     def disconnect(self):
         self.connected=False
@@ -3654,16 +3785,21 @@ class DataManager:
 
     def _parse(self,raw):
         # Log grezzo: timestamp + sentence, indipendente da pynmea2.
-        # Cosi' la textbox mostra i dati anche se la libreria manca.
-        ts_short = datetime.now().strftime('%H:%M:%S')
-        self.nmea_log.append(f'{ts_short} {raw}')
+        try:
+            ts_short = datetime.now().strftime('%H:%M:%S')
+            self.nmea_log.append(f'{ts_short} {raw}')
+        except Exception:
+            pass
         if not HAS_PYNMEA2: return
-        try: msg=pynmea2.parse(raw)
-        except: return
+        try:
+            msg = pynmea2.parse(raw)
+        except Exception:
+            return
         def _f(a):
-            v=getattr(msg,a,None)
-            try: return float(v) if v else None
-            except: return None
+            v = getattr(msg, a, None)
+            if v is None or v == '': return None
+            try: return float(v)
+            except (TypeError, ValueError): return None
         with self._lock:
             if _f('latitude'):  self.gps_lat=_f('latitude')
             if _f('longitude'): self.gps_lon=_f('longitude')
@@ -3865,7 +4001,9 @@ class TabScreen(Screen):
             self._gps.text='GPS --'; self._gps.color=MUTED
 
     def refresh(self): pass
-    def tick(self,dt): self._upd_gps()
+    def tick(self,dt):
+        try: self._upd_gps()
+        except Exception: pass
 
 # =============================================================================
 # 1 -- NAVIGAZIONE
@@ -3970,86 +4108,89 @@ class NavigationScreen(TabScreen):
         except: pass
 
     def tick(self,dt):
-        super().tick(dt); dm=self.dm
+        super().tick(dt)
+        try:
+            self._tick_nav()
+        except Exception as e:
+            log_err('NavigationScreen.tick', exc=e)
+
+    def _tick_nav(self):
+        dm=self.dm
         self.b_stw.set_value(f'{dm.boat_speed:.1f}')
         self.b_cog.set_value(f'{dm.boat_course:03.0f}')
         self._hdg.text=f'HDG  {dm.boat_heading:03.0f}'
 
         # Consiglio tattico: lato buono / vira
-        advice, shift = dm.tactical_advice()
-        if advice is None:
-            self._tac.text='—'
-            self._tac.color=MUTED
-        elif advice == 'LATO BUONO':
-            self._tac.text=f'LATO BUONO\n+{shift:.0f}°' if shift else 'LATO BUONO'
-            self._tac.color=GREEN
-        elif advice == 'VIRA':
-            self._tac.text=f'VIRA\n{shift:+.0f}°' if shift else 'VIRA'
-            self._tac.color=ORANGE
-        elif advice == 'LAYLINE':
-            self._tac.text='VIRA\n(layline)'
-            self._tac.color=YELLOW
-        else:  # 'OK'
-            self._tac.text=f'OK\n{shift:+.0f}°' if shift else 'OK'
-            self._tac.color=WHITE
-        if dm.polar_active() and dm.target_bsp is not None:
-            pct=dm.boat_speed/dm.target_bsp*100
-            col=GREEN if pct>=95 else ORANGE
-            self.b_tgt.set_value(f'{dm.target_bsp:.1f}',col)
-            # Vela suggerita dal crossover (se polare v2 con sezione 'sails').
-            # Append non invasivo: niente cambia se la polare e' v1.
-            sail_id = None
-            if (dm.polar.has_sails() and dm.true_wind_speed
-                    and dm.true_wind_angle is not None):
-                sail_id = dm.polar.get_sail(dm.true_wind_speed,
-                                              dm.true_wind_angle)
-            sail_str = f'  [{sail_id}]' if sail_id else ''
-            self._polar_lbl.text=(f'{dm.polar.boat_name}  '
-                                   f'{dm.target_bsp:.1f}kn  ({pct:.0f}%)'
-                                   f'{sail_str}')
-            self._polar_lbl.color=col
-        else:
-            # 3 casi distinti per la label di stato:
-            # 1. polare non caricata        -> "NON CARICATA" (rosso)
-            # 2. polare caricata ma toggle OFF -> "DISATTIVATA" (arancio)
-            # 3. polare ATTIVA ma manca dato vento NMEA -> "Attesa vento NMEA" (grigio)
-            # Senza il caso 3 distinto, l'app diceva DISATTIVATA anche con la
-            # polare ON ogni volta che il router NMEA non spediva True Wind,
-            # confondendo l'utente.
-            self.b_tgt.set_value('--', RED)
-            if not dm.polar.loaded:
-                self._polar_lbl.text='Polare: NON CARICATA - target N/D'
-                self._polar_lbl.color=RED
-            elif not dm.polar_enabled:
-                self._polar_lbl.text='Polare: DISATTIVATA - target N/D'
-                self._polar_lbl.color=ORANGE
+        try:
+            advice, shift = dm.tactical_advice()
+            if advice is None:
+                self._tac.text='—'; self._tac.color=MUTED
+            elif advice == 'LATO BUONO':
+                self._tac.text=f'LATO BUONO\n+{shift:.0f}°' if shift else 'LATO BUONO'
+                self._tac.color=GREEN
+            elif advice == 'VIRA':
+                self._tac.text=f'VIRA\n{shift:+.0f}°' if shift else 'VIRA'
+                self._tac.color=ORANGE
+            elif advice == 'LAYLINE':
+                self._tac.text='VIRA\n(layline)'; self._tac.color=YELLOW
             else:
-                # Polare attiva ma niente target_bsp -> in attesa di TWS/TWA
-                # validi dall'NMEA. Mostro nome barca per confermare che la
-                # polare e' caricata e attiva.
-                boat = dm.polar.boat_name or '(senza nome)'
-                self._polar_lbl.text=(f'{boat}  ATTIVA  -- '
-                                       f'attesa vento NMEA')
-                self._polar_lbl.color=MUTED
-        if dm.vmg is not None:
-            self.b_vmg.set_value(f'{dm.vmg:.1f}',GREEN if dm.vmg>0 else RED)
-        if dm.true_wind_speed:     self.b_tws.set_value(f'{dm.true_wind_speed:.1f}')
-        if dm.true_wind_angle:     self.b_twa.set_value(f'{dm.true_wind_angle:.0f}')
-        if dm.apparent_wind_angle: self.b_awa.set_value(f'{dm.apparent_wind_angle:.0f}')
-        if dm.apparent_wind_speed: self.b_aws.set_value(f'{dm.apparent_wind_speed:.1f}')
-        if dm.depth>0: self.b_dep.set_value(f'{dm.depth:.1f}',RED if dm.depth<3 else GREEN)
-        if dm.bearing_to_mark:  self.b_brg.set_value(f'{dm.bearing_to_mark:.0f}')
-        if dm.distance_to_mark:
-            self.b_dist.set_value(f'{dm.distance_to_mark:.2f}')
-            # ETA polar-aware: in bolina considera la VMG target dalla polare
-            # (la barca deve bordeggiare e percorre piu' strada di quella
-            # diretta). Se polare assente, fallback su distanza/boat_speed.
-            eta_min = dm.eta_polar_aware()
-            if eta_min is not None:
-                self.b_eta.set_value(f'{eta_min}')
-        self.compass.heading=dm.boat_heading; self.compass.twa=dm.true_wind_angle or 0
-        # Nota: setter di heading/twa triggerano gia' _req tramite il bind,
-        # non serve un secondo schedule_once che potrebbe causare race condition.
+                self._tac.text=f'OK\n{shift:+.0f}°' if shift else 'OK'
+                self._tac.color=WHITE
+        except Exception as e:
+            self._tac.text='?'; log_err('tactical_advice', exc=e)
+
+        # Polare
+        try:
+            if dm.polar_active() and dm.target_bsp is not None:
+                pct = dm.boat_speed / dm.target_bsp * 100 if dm.target_bsp else 0
+                col = GREEN if pct >= 95 else ORANGE
+                self.b_tgt.set_value(f'{dm.target_bsp:.1f}', col)
+                sail_id = None
+                if (dm.polar.has_sails() and dm.true_wind_speed
+                        and dm.true_wind_angle is not None):
+                    sail_id = dm.polar.get_sail(dm.true_wind_speed, dm.true_wind_angle)
+                sail_str = f'  [{sail_id}]' if sail_id else ''
+                self._polar_lbl.text = (f'{dm.polar.boat_name}  '
+                                        f'{dm.target_bsp:.1f}kn  ({pct:.0f}%){sail_str}')
+                self._polar_lbl.color = col
+            else:
+                self.b_tgt.set_value('--', RED)
+                if not dm.polar.loaded:
+                    self._polar_lbl.text='Polare: NON CARICATA - target N/D'; self._polar_lbl.color=RED
+                elif not dm.polar_enabled:
+                    self._polar_lbl.text='Polare: DISATTIVATA - target N/D'; self._polar_lbl.color=ORANGE
+                else:
+                    boat = dm.polar.boat_name or '(senza nome)'
+                    self._polar_lbl.text=f'{boat}  ATTIVA  -- attesa vento NMEA'
+                    self._polar_lbl.color=MUTED
+        except Exception as e:
+            self.b_tgt.set_value('??', RED); log_err('polar tick', exc=e)
+
+        # Dati vento / profondità / boa
+        try:
+            if dm.vmg is not None:
+                self.b_vmg.set_value(f'{dm.vmg:.1f}', GREEN if dm.vmg > 0 else RED)
+            if dm.true_wind_speed:     self.b_tws.set_value(f'{dm.true_wind_speed:.1f}')
+            if dm.true_wind_angle:     self.b_twa.set_value(f'{dm.true_wind_angle:.0f}')
+            if dm.apparent_wind_angle: self.b_awa.set_value(f'{dm.apparent_wind_angle:.0f}')
+            if dm.apparent_wind_speed: self.b_aws.set_value(f'{dm.apparent_wind_speed:.1f}')
+            if dm.depth > 0:
+                self.b_dep.set_value(f'{dm.depth:.1f}', RED if dm.depth < 3 else GREEN)
+            if dm.bearing_to_mark:
+                self.b_brg.set_value(f'{dm.bearing_to_mark:.0f}')
+            if dm.distance_to_mark:
+                self.b_dist.set_value(f'{dm.distance_to_mark:.2f}')
+                eta_min = dm.eta_polar_aware()
+                if eta_min is not None:
+                    self.b_eta.set_value(f'{eta_min}')
+        except Exception as e:
+            log_err('nav instruments tick', exc=e)
+
+        try:
+            self.compass.heading = dm.boat_heading
+            self.compass.twa = dm.true_wind_angle or 0
+        except Exception:
+            pass
 
 # =============================================================================
 # 2 -- PARTENZA
@@ -4131,62 +4272,68 @@ class StartLineScreen(TabScreen):
         m,s=int(rem//60),int(rem%60)
         self._t.text=f'{m}:{s:02d}'; self._t.color=RED if rem<60 else GREEN; return True
     def _toggle_pin(self):
-        """Toggle PIN: se non impostato lo segna (con fallback GPS interno),
-        se gia' impostato lo toglie. Il pulsante cambia testo di conseguenza.
-        Pin e RC sono volatili (in memoria, non persistiti su file)."""
-        if self._pin is not None:
-            # Togli PIN
-            self._pin = None
-            self._pin_lbl.text = 'Pin (SX): non impostato'
-            self._pin_lbl.color = WHITE
-            self._pin_btn.text = 'Segna PIN'
-            self._pin_btn.background_color = BTN_GRAY
-            self._line_lbl.text = 'Lung: --   Brg: --'
-            self._dist_lbl.text = 'Distanza: --  m'
-            return
-        # Segna PIN: usa NMEA o GPS interno
-        lat, lon, src = self._get_position()
-        if lat is None:
-            self._pin_lbl.text = 'Pin (SX): GPS NON DISPONIBILE'
+        """Toggle PIN: segna o toglie il pin SX con fallback GPS interno."""
+        try:
+            if self._pin is not None:
+                self._pin = None
+                self._pin_lbl.text = 'Pin (SX): non impostato'
+                self._pin_lbl.color = WHITE
+                self._pin_btn.text = 'Segna PIN'
+                self._pin_btn.background_color = BTN_GRAY
+                self._line_lbl.text = 'Lung: --   Brg: --'
+                self._dist_lbl.text = 'Distanza: --  m'
+                return
+            lat, lon, src = self._get_position()
+            if lat is None:
+                self._pin_lbl.text = 'Pin (SX): GPS NON DISPONIBILE'
+                self._pin_lbl.color = RED
+                return
+            self._pin = (lat, lon)
+            src_tag = ' [int]' if src == 'internal' else ''
+            self._pin_lbl.text = f'Pin (SX){src_tag}: {lat:.5f}  {lon:.5f}'
+            self._pin_lbl.color = GREEN
+            self._pin_btn.text = 'Togli PIN'
+            self._pin_btn.background_color = ORANGE
+            self._upd_line()
+        except Exception as e:
+            log_err('_toggle_pin', exc=e)
+            self._pin_lbl.text = f'Pin (SX): ERRORE ({type(e).__name__})'
             self._pin_lbl.color = RED
-            return
-        self._pin = (lat, lon)
-        src_tag = ' [int]' if src == 'internal' else ''
-        self._pin_lbl.text = f'Pin (SX){src_tag}: {lat:.5f}  {lon:.5f}'
-        self._pin_lbl.color = GREEN
-        self._pin_btn.text = 'Togli PIN'
-        self._pin_btn.background_color = ORANGE
-        self._upd_line()
 
     def _toggle_rc(self):
-        """Toggle RC: se non impostato lo segna (con fallback GPS interno),
-        se gia' impostato lo toglie. Vedi _toggle_pin per la logica generale."""
-        if self._rc is not None:
-            # Togli RC
-            self._rc = None
-            self._rc_lbl.text = 'RC  (DX): non impostato'
-            self._rc_lbl.color = WHITE
-            self._rc_btn.text = 'Segna RC'
-            self._rc_btn.background_color = BTN_GRAY
-            self._line_lbl.text = 'Lung: --   Brg: --'
-            return
-        # Segna RC
-        lat, lon, src = self._get_position()
-        if lat is None:
-            self._rc_lbl.text = 'RC  (DX): GPS NON DISPONIBILE'
+        """Toggle RC: segna o toglie il RC DX con fallback GPS interno."""
+        try:
+            if self._rc is not None:
+                self._rc = None
+                self._rc_lbl.text = 'RC  (DX): non impostato'
+                self._rc_lbl.color = WHITE
+                self._rc_btn.text = 'Segna RC'
+                self._rc_btn.background_color = BTN_GRAY
+                self._line_lbl.text = 'Lung: --   Brg: --'
+                return
+            lat, lon, src = self._get_position()
+            if lat is None:
+                self._rc_lbl.text = 'RC  (DX): GPS NON DISPONIBILE'
+                self._rc_lbl.color = RED
+                return
+            self._rc = (lat, lon)
+            src_tag = ' [int]' if src == 'internal' else ''
+            self._rc_lbl.text = f'RC  (DX){src_tag}: {lat:.5f}  {lon:.5f}'
+            self._rc_lbl.color = GREEN
+            self._rc_btn.text = 'Togli RC'
+            self._rc_btn.background_color = ORANGE
+            self._upd_line()
+        except Exception as e:
+            log_err('_toggle_rc', exc=e)
+            self._rc_lbl.text = f'RC  (DX): ERRORE ({type(e).__name__})'
             self._rc_lbl.color = RED
-            return
-        self._rc = (lat, lon)
-        src_tag = ' [int]' if src == 'internal' else ''
-        self._rc_lbl.text = f'RC  (DX){src_tag}: {lat:.5f}  {lon:.5f}'
-        self._rc_lbl.color = GREEN
-        self._rc_btn.text = 'Togli RC'
-        self._rc_btn.background_color = ORANGE
-        self._upd_line()
     def _upd_line(self):
-        if self._pin and self._rc:
-            d,b=calc_dist_brg(self._pin[0],self._pin[1],self._rc[0],self._rc[1])
-            if d: self._line_lbl.text=f'Lung: {d*1852:.0f}m   Brg: {b:.1f}'
+        try:
+            if self._pin and self._rc:
+                d,b=calc_dist_brg(self._pin[0],self._pin[1],self._rc[0],self._rc[1])
+                if d: self._line_lbl.text=f'Lung: {d*1852:.0f}m   Brg: {b:.1f}'
+        except Exception as e:
+            log_err('_upd_line', exc=e)
 
     def _get_position(self):
         """Restituisce (lat, lon, source) usando GPS NMEA se disponibile,
@@ -4223,10 +4370,15 @@ class StartLineScreen(TabScreen):
         return None, None, None
 
     def tick(self,dt):
-        super().tick(dt); dm=self.dm
-        if self._pin and dm.gps_lat:
-            d,_=calc_dist_brg(dm.gps_lat,dm.gps_lon,self._pin[0],self._pin[1])
-            if d is not None: self._dist_lbl.text=f'Distanza: {d*1852:.0f}  m'
+        super().tick(dt)
+        try:
+            dm=self.dm
+            if self._pin and dm.gps_lat is not None and dm.gps_lon is not None:
+                d,_=calc_dist_brg(dm.gps_lat,dm.gps_lon,self._pin[0],self._pin[1])
+                if d is not None:
+                    self._dist_lbl.text=f'Distanza: {d*1852:.0f}  m'
+        except Exception as e:
+            log_err('StartLineScreen.tick', exc=e)
 
 # =============================================================================
 # 3 -- LAYLINE
@@ -4316,62 +4468,59 @@ class LayLineScreen(TabScreen):
         except: pass
 
     def tick(self,dt):
-        super().tick(dt); dm=self.dm
-        self._r['Boa'].text     =dm.target_mark or '--'
-        self._r['Bearing'].text =f'{dm.bearing_to_mark:.0f}'    if dm.bearing_to_mark  else '--'
-        self._r['Distanza'].text=f'{dm.distance_to_mark:.3f}NM' if dm.distance_to_mark else '--'
-        self._r['VMG'].text     =f'{dm.vmg:.2f}kn'              if dm.vmg              else '--'
-        self._r['TWA'].text     =f'{dm.true_wind_angle:.1f}'    if dm.true_wind_angle  else '--'
-        self._r['TWS'].text     =f'{dm.true_wind_speed:.1f}kn'  if dm.true_wind_speed  else '--'
+        super().tick(dt)
+        try:
+            self._tick_lay()
+        except Exception as e:
+            log_err('LaylineScreen.tick', exc=e)
 
-        # ETA polar-aware (gestisce internamente bolina/poppa/lasco e fallback
-        # a boat_speed se la polare manca)
+    def _tick_lay(self):
+        dm=self.dm
+        self._r['Boa'].text      = dm.target_mark or '--'
+        self._r['Bearing'].text  = f'{dm.bearing_to_mark:.0f}'    if dm.bearing_to_mark  else '--'
+        self._r['Distanza'].text = f'{dm.distance_to_mark:.3f}NM' if dm.distance_to_mark else '--'
+        self._r['VMG'].text      = f'{dm.vmg:.2f}kn'              if dm.vmg              else '--'
+        self._r['TWA'].text      = f'{dm.true_wind_angle:.1f}'    if dm.true_wind_angle  else '--'
+        self._r['TWS'].text      = f'{dm.true_wind_speed:.1f}kn'  if dm.true_wind_speed  else '--'
         eta_min = dm.eta_polar_aware()
         self._r['ETA'].text = f'{eta_min}m' if eta_min is not None else '--'
-
-        # LAYLINES REALI: usano il TWA target dalla polare per calcolare
-        #   - cog_port      = rotta da tenere su mura sinistra
-        #   - cog_starboard = rotta da tenere su mura dritta
-        #   - dist_along_*  = NM da percorrere su quella mura prima di virare
-        # Se la polare manca o non c'e' boa attiva, mostriamo '--'.
-        lay = dm.laylines_to_mark() if dm.target_mark else None
-        if lay:
-            dp_ = lay['dist_along_port']
-            ds_ = lay['dist_along_starboard']
-            on  = lay['on_layline']
-            mark_p = ' *' if on == 'port'      else ''
-            mark_s = ' *' if on == 'starboard' else ''
-            self._rp.text = (f"{lay['cog_port']:03.0f}  "
-                             f"{dp_:.2f}NM{mark_p}" if dp_ is not None
-                             else f"{lay['cog_port']:03.0f}  --")
-            self._rs.text = (f"{lay['cog_starboard']:03.0f}  "
-                             f"{ds_:.2f}NM{mark_s}" if ds_ is not None
-                             else f"{lay['cog_starboard']:03.0f}  --")
-        else:
-            # Senza polare o senza boa non possiamo calcolare le laylines vere.
-            # Mostriamo '--' invece di un ETA ingannevole.
-            self._rp.text = '--'
-            self._rs.text = '--'
-
-        # Consiglio tattico (stessa logica della schermata Navigation)
-        advice, shift = dm.tactical_advice()
-        if advice is None:
-            self._tac.text='—'
-            self._tac.color=MUTED
-        elif advice == 'LATO BUONO':
-            self._tac.text=f'LATO BUONO  +{shift:.0f}°' if shift else 'LATO BUONO'
-            self._tac.color=GREEN
-        elif advice == 'VIRA':
-            self._tac.text=f'VIRA  {shift:+.0f}°' if shift else 'VIRA'
-            self._tac.color=ORANGE
-        elif advice == 'LAYLINE':
-            self._tac.text='VIRA (layline)'
-            self._tac.color=YELLOW
-        else:  # 'OK'
-            self._tac.text=f'OK  {shift:+.0f}°' if shift else 'OK'
-            self._tac.color=WHITE
-
-        Clock.schedule_once(lambda dt:self.tact.redraw(),0)
+        try:
+            lay = dm.laylines_to_mark() if dm.target_mark else None
+            if lay:
+                dp_ = lay.get('dist_along_port')
+                ds_ = lay.get('dist_along_starboard')
+                on  = lay.get('on_layline')
+                mark_p = ' *' if on == 'port'      else ''
+                mark_s = ' *' if on == 'starboard' else ''
+                self._rp.text = (f"{lay['cog_port']:03.0f}  {dp_:.2f}NM{mark_p}"
+                                 if dp_ is not None else f"{lay['cog_port']:03.0f}  --")
+                self._rs.text = (f"{lay['cog_starboard']:03.0f}  {ds_:.2f}NM{mark_s}"
+                                 if ds_ is not None else f"{lay['cog_starboard']:03.0f}  --")
+            else:
+                self._rp.text = '--'; self._rs.text = '--'
+        except Exception as e:
+            self._rp.text='??'; self._rs.text='??'; log_err('laylines_to_mark', exc=e)
+        try:
+            advice, shift = dm.tactical_advice()
+            if advice is None:
+                self._tac.text='—'; self._tac.color=MUTED
+            elif advice == 'LATO BUONO':
+                self._tac.text=f'LATO BUONO  +{shift:.0f}°' if shift else 'LATO BUONO'
+                self._tac.color=GREEN
+            elif advice == 'VIRA':
+                self._tac.text=f'VIRA  {shift:+.0f}°' if shift else 'VIRA'
+                self._tac.color=ORANGE
+            elif advice == 'LAYLINE':
+                self._tac.text='VIRA (layline)'; self._tac.color=YELLOW
+            else:
+                self._tac.text=f'OK  {shift:+.0f}°' if shift else 'OK'
+                self._tac.color=WHITE
+        except Exception as e:
+            self._tac.text='?'; log_err('tactical_advice lay', exc=e)
+        try:
+            Clock.schedule_once(lambda dt: self.tact.redraw(), 0)
+        except Exception:
+            pass
 
 # =============================================================================
 # 4 -- WAYPOINTS
@@ -4441,13 +4590,15 @@ class WaypointMapWidget(Widget):
         Rectangle(texture=tex, pos=(x, y), size=(w, h))
 
     def redraw(self, *_):
-        # Guard standard: non disegnare se non attaccato/dimensionato
         try:
             if self.get_root_window() is None: return
             if self.width < dp(10) or self.height < dp(10): return
             self.canvas.clear()
         except Exception:
             return
+        # Svuota cache se troppo grande (memory leak su lunghe sessioni)
+        if len(self._lbl_cache) > 200:
+            self._lbl_cache.clear()
 
         # Sfondo + bordo
         with self.canvas:
@@ -4648,20 +4799,17 @@ class WaypointsScreen(TabScreen):
         self._refresh()
 
     def on_enter(self):
-        """Ogni volta che si entra nella schermata WPT ricarica i waypoint
-        dal file: cosi' eventuali modifiche fatte fuori (editor esterno o
-        sync da altra source) sono subito visibili. La selezione precedente
-        viene scartata perche' i riferimenti agli oggetti dict cambiano."""
-        # Ricarico dal file (sovrascrive self.dm.waypoints con dict NUOVI:
-        # le reference precedenti a self._sel non valgono piu')
-        self.dm._load_waypoints_json()
+        """Ricarica waypoints dal file ad ogni ingresso nella schermata."""
+        try:
+            self.dm._load_waypoints_json()
+        except Exception as e:
+            log_err('WaypointsScreen.on_enter _load_waypoints_json', exc=e)
         self._sel = None
-        # super().on_enter() gestisce highlight sidebar e _upd_gps, ma
-        # NON chiama _refresh (la base TabScreen.refresh() e' vuota di
-        # default). Quindi richiamo io _refresh per ridisegnare lista+mappa
-        # con i dati appena ricaricati dal file.
         super().on_enter()
-        self._refresh()
+        try:
+            self._refresh()
+        except Exception as e:
+            log_err('WaypointsScreen.on_enter _refresh', exc=e)
 
     def _do_resize(self,dt):
         try: Clock.schedule_once(lambda dt:self._map.redraw(),0)
@@ -4684,13 +4832,19 @@ class WaypointsScreen(TabScreen):
         return f"{deg}\u00b0{mins:06.3f}'{hemi}"
 
     def _refresh(self):
-        self._lb.clear_widgets()
-        self._mark.text = self.dm.target_mark or '--'
-        # Calcolo qual e' il prossimo waypoint dopo quello attivo, cosi' lo
-        # marchio nella lista con una freccia: l'utente vede in anticipo dove
-        # l'auto-advance lo portera' dopo il superamento della boa attiva.
-        next_after = (self.dm._next_target_after(self.dm.target_mark)
-                      if self.dm.target_mark else None)
+        try:
+            self._lb.clear_widgets()
+        except Exception:
+            pass
+        try:
+            self._mark.text = self.dm.target_mark or '--'
+        except Exception:
+            pass
+        try:
+            next_after = (self.dm._next_target_after(self.dm.target_mark)
+                          if self.dm.target_mark else None)
+        except Exception:
+            next_after = None
         for wpt in self.dm.waypoints:
             name = wpt.get('name', '?')
             is_active = (name == self.dm.target_mark)
@@ -4704,12 +4858,14 @@ class WaypointsScreen(TabScreen):
                 marker = '  '
             side = wpt.get('side', 'port')
             side_lbl = 'SX' if side == 'port' else 'DX'
-            lat_s = self._fmt_dm(wpt.get('lat'), is_lat=True)
-            lon_s = self._fmt_dm(wpt.get('lon'), is_lat=False)
+            try:
+                lat_s = self._fmt_dm(wpt.get('lat'), is_lat=True)
+                lon_s = self._fmt_dm(wpt.get('lon'), is_lat=False)
+            except Exception:
+                lat_s = lon_s = '??'
             txt = (f"   {marker}{name}    "
                    f"{lat_s}  {lon_s}   "
                    f"[{side_lbl}]")
-            # Evidenzia in arancio se selezionato
             is_sel = (self._sel is wpt)
             bg_col = ACCENT if is_sel else SIDEBAR
             txt_col = (0, 0, 0, 1) if is_sel else WHITE
@@ -4718,14 +4874,8 @@ class WaypointsScreen(TabScreen):
                        background_color=bg_col, background_normal='',
                        color=txt_col, halign='left', valign='middle',
                        padding=(dp(12), dp(4)))
-            # text_size dimensionato sulla larghezza disponibile della COLONNA
-            # SINISTRA (sl' della WaypointsScreen, ~55% di Window meno
-            # sidebar e padding). Senza limite la halign='left' non
-            # allinea correttamente, e con il valore vecchio (Window.width
-            # intero) il testo eccedeva la larghezza del button e finiva
-            # tagliato a sinistra al rendering.
-            col_w = (Window.width - SIDEBAR_W) * 0.55 - dp(40)
-            b.text_size = (max(col_w, dp(150)), None)
+            col_w = max((Window.width - SIDEBAR_W) * 0.55 - dp(40), dp(150))
+            b.text_size = (col_w, None)
             b.bind(on_release=lambda _, w=wpt: self._select(w))
             self._lb.add_widget(b)
         # Aggiorna anche la mappa (dopo modifiche/selezioni cambia il target)
@@ -4738,162 +4888,203 @@ class WaypointsScreen(TabScreen):
         self._refresh()
 
     def _set_mark(self):
-        """Imposta il waypoint selezionato come boa attiva (target_mark).
-        Persiste nel config (sailing_config.json) cosi' al riavvio resta.
-        I waypoint stessi NON vengono toccati: questa modifica riguarda solo
-        la 'destinazione corrente'.
-
-        Da qui in poi, advance_target_if_passed() vigilera' sul superamento
-        di questa boa per fare lo switch automatico al prossimo waypoint."""
-        if self._sel:
+        """Imposta il waypoint selezionato come boa attiva (target_mark)."""
+        if not self._sel:
+            return
+        try:
             self.dm.target_mark = self._sel.get('name')
-            # Reset del rilevatore CPA: stiamo iniziando il tracking di una
-            # nuova boa, non vogliamo che il vecchio min_distance influenzi
-            # la nuova decisione di switch.
             self.dm._reset_mark_pass_state()
             self.dm.save_cfg_safe()
             self._refresh()
+        except Exception as e:
+            log_err('_set_mark', exc=e)
 
     def _del(self):
-        """Cancella il waypoint selezionato dal file. File-first:
-        la rimozione viene fatta direttamente sul waypoints.json e poi
-        self.dm.waypoints viene ricaricato dal file."""
+        """Cancella il waypoint selezionato dal file."""
         if not self._sel:
             return
-        name = self._sel.get('name', '')
-        ok, err = self.dm.waypoint_delete(name)
-        if not ok:
-            Popup(title='Errore rimozione',
-                  content=Label(text=err or 'Errore non specificato'),
+        try:
+            name = self._sel.get('name', '')
+            ok, err = self.dm.waypoint_delete(name)
+            if not ok:
+                Popup(title='Errore rimozione',
+                      content=Label(text=err or 'Errore non specificato'),
+                      size_hint=(0.5, 0.22)).open()
+                return
+            self._sel = None
+            self._refresh()
+        except Exception as e:
+            log_err('waypoint _del', exc=e)
+            Popup(title='Errore', content=Label(text=str(e)),
                   size_hint=(0.5, 0.22)).open()
-            return
-        self._sel = None
-        self._refresh()
 
     def _reload_from_file(self):
-        """Forza la ricarica dei waypoint dal file waypoints.json sul disco.
-
-        Caso d'uso: l'utente ha modificato il file dall'esterno (editor di
-        testo, sync, copia da altro device) e vuole che l'app legga subito
-        i nuovi valori senza dover uscire e rientrare nella schermata.
-
-        Comportamento:
-        - Se il file NON esiste, lo crea con i default (Boa1/Boa2/Arrivo)
-          chiamando _ensure_waypoints_file(), poi ricarica.
-        - Se il file esiste, lo legge e sovrascrive self.dm.waypoints.
-        - Mostra un popup con esito (numero di waypoint caricati) o errore.
-        - La selezione viene scartata perche' i nuovi dict non sono gli
-          stessi oggetti di prima.
-        - Se la boa attiva (target_mark) non e' piu' presente nei waypoint
-          ricaricati, viene azzerata."""
-        # 1) Se il file manca, crealo dai default. Cosi' il pulsante e'
-        #    "self-healing": funziona sempre, non lascia l'utente con UI
-        #    vuota se per qualche motivo il file e' stato cancellato.
-        created = _ensure_waypoints_file()
-
-        # 2) Ricarica dal file
-        ok = self.dm._load_waypoints_json()
-        n = len(self.dm.waypoints)
-
-        # 3) Se la boa attiva non c'e' piu', azzera target_mark
-        if self.dm.target_mark and not any(
-                w.get('name') == self.dm.target_mark
-                for w in self.dm.waypoints):
-            self.dm.target_mark = None
-            self.dm._reset_mark_pass_state()
-            self.dm.save_cfg_safe()
-
-        # 4) Reset selezione e refresh UI
-        self._sel = None
-        self._refresh()
-
-        # 5) Feedback all'utente
-        if created:
-            msg = (f'File mancante: creato con default.\n'
-                   f'Caricati {n} waypoint.')
-        elif ok:
-            msg = f'Caricati {n} waypoint da file.'
-        else:
-            msg = ('Errore lettura waypoints.json\n'
-                   '(il file esiste ma non e\' valido).')
-        Popup(title='Carica da file',
-              content=Label(text=msg, halign='center', valign='middle'),
-              size_hint=(0.5, 0.28)).open()
+        """Forza la ricarica dei waypoint dal file waypoints.json."""
+        try:
+            created = _ensure_waypoints_file()
+            ok = self.dm._load_waypoints_json()
+            n = len(self.dm.waypoints)
+            if self.dm.target_mark and not any(
+                    w.get('name') == self.dm.target_mark
+                    for w in self.dm.waypoints):
+                self.dm.target_mark = None
+                self.dm._reset_mark_pass_state()
+                self.dm.save_cfg_safe()
+            self._sel = None
+            self._refresh()
+            if created:
+                msg = f'File mancante: ricreato con default.\nCaricati {n} waypoint.'
+            elif ok:
+                msg = f'Caricati {n} waypoint da file.'
+            else:
+                msg = 'Errore lettura waypoints.json (file non valido).'
+            Popup(title='Carica da file',
+                  content=Label(text=msg, halign='center', valign='middle'),
+                  size_hint=(0.5, 0.28)).open()
+        except Exception as e:
+            log_err('_reload_from_file waypoints', exc=e)
+            Popup(title='Errore',
+                  content=Label(text=f'{type(e).__name__}: {e}'),
+                  size_hint=(0.5, 0.25)).open()
 
     def _download_from_web(self):
-        """Scarica waypoints.json dal cloud blob storage e lo salva localmente.
-
-        URL: {blob_base}/waypoints/{cloud_boat_id}/waypoints.json
-        I parametri sono in sailing_config.json.
-
-        Pattern UI bulletproof (idem _download_from_cloud):
-        - Un solo Popup, un solo Label, un solo Button creati a inizio.
-        - Worker aggiorna SOLO il testo della label (mai widget nuovi).
-        - try/except globale: errori inattesi visibili nel popup, no crash."""
-        url = self.dm.download_waypoints_url()
-        if not url:
-            Popup(title='Scarica da web',
+        """Picker blob in due fasi:
+        1. Mostra popup 'Caricamento lista...' e chiama list_waypoint_blobs()
+           in thread (non blocca UI).
+        2. Se la lista arriva, mostra i file come pulsanti selezionabili
+           nel popup stesso (riusa lo stesso container, niente nuovo Popup).
+        3. Al click su un file, avvia il download in thread e aggiorna lo
+           stato nel popup. Pulsante Chiudi abilitato solo a fine operazione.
+        """
+        dm = self.dm
+        if not dm.cloud_boat_id:
+            Popup(title='Scarica da cloud',
                   content=Label(text='cloud_boat_id non configurato.\n'
-                                     'Imposta il valore in sailing_config.json',
+                                     'Imposta in sailing_config.json.',
                                 halign='center', valign='middle'),
-                  size_hint=(0.6, 0.30)).open()
+                  size_hint=(0.6, 0.28)).open()
             return
 
-        # Popup costruito UNA volta, mai modificato strutturalmente
-        box = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
-        status_lbl = Label(text=f'Scaricamento da:\n{url}\n\nAttendere...',
-                            halign='center', valign='middle', color=WHITE)
-        status_lbl.bind(size=lambda l, _: setattr(l, 'text_size', l.size))
-        box.add_widget(status_lbl)
-        close_btn = Button(text='Attendere...',
-                            size_hint_y=None, height=dp(48),
-                            background_color=BTN_GRAY, background_normal='',
-                            color=WHITE, bold=True, disabled=True)
-        box.add_widget(close_btn)
+        # ── Costruzione popup (una volta sola, non modificato strutturalmente) ──
+        root = BoxLayout(orientation='vertical', spacing=dp(6), padding=dp(10))
 
-        pop = Popup(title='Scarica da web', content=box,
-                     size_hint=(0.80, 0.55), auto_dismiss=False)
+        status_lbl = Label(
+            text='Connessione al cloud...\nAttendere.',
+            font_size=sp(16), color=MUTED,
+            size_hint_y=None, height=dp(56),
+            halign='center', valign='middle')
+        status_lbl.bind(size=lambda l,_: setattr(l,'text_size',l.size))
+        root.add_widget(status_lbl)
+
+        # ScrollView per la lista file (inizialmente vuota)
+        sv = ScrollView(do_scroll_x=False, size_hint=(1,1))
+        file_list = BoxLayout(orientation='vertical', spacing=dp(4),
+                               size_hint_y=None)
+        file_list.bind(minimum_height=file_list.setter('height'))
+        sv.add_widget(file_list)
+        root.add_widget(sv)
+
+        close_btn = Button(
+            text='Attendere...', disabled=True,
+            size_hint_y=None, height=dp(50),
+            background_color=BTN_GRAY, background_normal='',
+            color=WHITE, bold=True)
+        root.add_widget(close_btn)
+
+        pop = Popup(title='Scarica percorso dal cloud',
+                    content=root, size_hint=(0.88, 0.80),
+                    auto_dismiss=False)
         close_btn.bind(on_release=lambda _: pop.dismiss())
         pop.open()
 
-        def _finish(text, color, refresh_ui=False):
-            try:
-                if refresh_ui:
-                    # Aggiorno UI: nuova lista + reset selezione + check target
-                    if self.dm.target_mark and not any(
-                            w.get('name') == self.dm.target_mark
-                            for w in self.dm.waypoints):
-                        self.dm.target_mark = None
-                        self.dm._reset_mark_pass_state()
-                        self.dm.save_cfg_safe()
-                    self._sel = None
-                    self._refresh()
-                status_lbl.text  = text
-                status_lbl.color = color
-                close_btn.text   = 'Chiudi'
-                close_btn.disabled = False
-                pop.auto_dismiss = True
-            except Exception as e:
-                print(f'_download_from_web waypoints _finish: {e}')
+        def _enable_close(msg='', color=None):
+            status_lbl.text     = msg or status_lbl.text
+            if color: status_lbl.color = color
+            close_btn.text      = 'Chiudi'
+            close_btn.disabled  = False
+            pop.auto_dismiss    = True
 
-        def _worker():
+        def _do_download(item):
+            """Avvia download del file selezionato."""
+            file_list.clear_widgets()
+            status_lbl.text  = f"Download di:\n{item['display']}\n\nAttendere..."
+            status_lbl.color = WHITE
+            close_btn.disabled = True
+            close_btn.text     = 'Attendere...'
+
+            def _worker():
+                try:
+                    ok, msg = dm.download_waypoints_from_url(item['url'])
+                except Exception as e:
+                    ok, msg = False, f'{type(e).__name__}: {e}'
+                @mainthread
+                def _finish():
+                    if ok:
+                        # Aggiorna UI waypoint
+                        try:
+                            if dm.target_mark and not any(
+                                    w.get('name')==dm.target_mark
+                                    for w in dm.waypoints):
+                                dm.target_mark = None
+                                dm._reset_mark_pass_state()
+                                dm.save_cfg_safe()
+                            self._sel = None
+                            self._refresh()
+                        except Exception as e:
+                            log_err('_download_from_web finish refresh', exc=e)
+                        _enable_close(
+                            f"✓ {msg}\nFile: {item['display']}\n\n"
+                            f"Waypoint caricati: {len(dm.waypoints)}",
+                            GREEN)
+                    else:
+                        _enable_close(f"✗ Errore:\n{msg}", RED)
+                _finish()
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _show_list(items):
+            """Popola la ScrollView con i file trovati."""
+            file_list.clear_widgets()
+            status_lbl.text  = f'{len(items)} file trovati — scegli il percorso:'
+            status_lbl.color = WHITE
+            for item in items:
+                size_kb = ''
+                try:
+                    size_kb = f"  {int(item['size'])//1024}KB" if item['size'] != '?' else ''
+                except Exception:
+                    pass
+                label_txt = f"{item['display']}{size_kb}"
+                if item.get('date'):
+                    label_txt += f"\n{item['date']}"
+                btn = Button(
+                    text=label_txt,
+                    font_size=sp(16),
+                    size_hint_y=None, height=dp(64),
+                    background_color=SIDEBAR, background_normal='',
+                    color=WHITE, halign='left', valign='middle',
+                    padding=(dp(12), dp(4)))
+                btn.text_size = (Window.width * 0.78, None)
+                btn.bind(on_release=lambda _, i=item: _do_download(i))
+                file_list.add_widget(btn)
+            _enable_close()  # abilita Chiudi anche se non si seleziona nulla
+            # Non disabilitare subito: l'utente potrebbe voler solo vedere la lista
+            close_btn.disabled = False
+            close_btn.text = 'Annulla'
+
+        def _list_worker():
             try:
-                ok, msg = self.dm.download_waypoints_from_web()
+                ok, result = dm.list_waypoint_blobs()
+            except Exception as e:
+                ok, result = False, f'{type(e).__name__}: {e}'
+            @mainthread
+            def _update():
                 if ok:
-                    Clock.schedule_once(lambda dt: _finish(
-                        f'OK: {msg}\n\nFile salvato in:\n{WAYPOINTS_PATH}',
-                        GREEN, refresh_ui=True), 0)
+                    _show_list(result)
                 else:
-                    Clock.schedule_once(lambda dt, m=msg: _finish(
-                        f'Errore download:\n{m}', RED), 0)
-            except Exception as e:
-                import traceback
-                print(f'_download_from_web waypoints CRASH:\n{traceback.format_exc()}')
-                Clock.schedule_once(
-                    lambda dt, m=f'{type(e).__name__}: {e}': _finish(
-                        f'Errore inatteso:\n{m}', RED), 0)
+                    _enable_close(f"✗ Impossibile listare i file:\n{result}", RED)
+            _update()
 
-        threading.Thread(target=_worker, daemon=True).start()
+        threading.Thread(target=_list_worker, daemon=True).start()
+
 
 # =============================================================================
 # 5 -- POLARI
@@ -5340,9 +5531,12 @@ class PolarScreen(TabScreen):
 
     def tick(self,dt):
         super().tick(dt)
-        if self.dm.polar.loaded:
-            self._upd_vmg()
-            self._upd_sail()
+        try:
+            if self.dm.polar.loaded:
+                self._upd_vmg()
+                self._upd_sail()
+        except Exception as e:
+            log_err('PolarScreen.tick', exc=e)
 
 # =============================================================================
 # 6 -- LOG REGATA (registrazione locale + upload one-shot + cloud live)
@@ -5710,28 +5904,35 @@ class LoggingScreen(TabScreen):
 
     def tick(self, dt):
         super().tick(dt)
-        self._refresh_log_ui()
-        self._refresh_errlog_status()
-        self._refresh_errlog_box()
+        try: self._refresh_log_ui()
+        except Exception as e: log_err('refresh_log_ui', exc=e)
+        try: self._refresh_errlog_status()
+        except Exception: pass
+        try: self._refresh_errlog_box()
+        except Exception: pass
 
     def _refresh_errlog_box(self):
-        """Aggiorna la textbox con il contenuto grezzo del log errori odierno.
-        Legge il file ogni tick: e' piccolo (<100KB tipicamente) e l'operazione
-        e' quasi istantanea su disco locale. In caso di errore di lettura
-        mostra il messaggio d'errore stesso nella box."""
+        """Aggiorna la textbox con il contenuto grezzo del log errori odierno."""
         try:
             log_file = _error_logger._current_file()
             if os.path.isfile(log_file):
+                # Legge solo gli ultimi 50KB per non bloccare l'UI su file grandi
                 with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                    f.seek(0, 2)  # EOF
+                    size = f.tell()
+                    if size > 50000:
+                        f.seek(size - 50000)
+                        f.readline()  # salta riga parziale
+                    else:
+                        f.seek(0)
                     raw = f.read()
                 txt = raw if raw.strip() else '(file vuoto)'
             else:
                 txt = '(nessun log oggi)'
             if self._errlog_box.text != txt:
                 self._errlog_box.text = txt
-                # Scorri alla fine (righe piu' recenti)
                 self._errlog_box.cursor = (len(txt), 0)
-        except Exception as e:
+        except Exception:
             pass
 
     def _refresh_errlog_status(self):
@@ -6431,53 +6632,49 @@ class SettingsScreen(TabScreen):
                               size_hint=(1,1))
         self.body.add_widget(self._cols)
 
-        # COLONNA SINISTRA: NMEA + TATTICA + PERCORSI FILE (tutti read-only)
-        left=BoxLayout(orientation='vertical',spacing=dp(10),
-                        padding=dp(14),size_hint_x=0.55)
+        # COLONNA SINISTRA: layout a due zone.
+        # Zona ALTA (size_hint_y=None, altezze fisse): controlli NMEA + TATTICA + CONFIG.
+        # Zona BASSA (size_hint_y=1, ~meta' pagina): NMEA LOG in tempo reale.
+        left=BoxLayout(orientation='vertical',spacing=dp(8),
+                        padding=dp(12),size_hint_x=0.55)
         _bg(left,PANEL)
-        left.add_widget(Label(text='NMEA TCP',font_size=sp(18),color=ACCENT,
-                               bold=True,size_hint_y=None,height=dp(36)))
-        # IP/Porta editabili (gli altri parametri restano read-only)
-        self._ip   = self._field(left, 'IP Server:', str(self.dm.nmea_ip))
-        self._port = self._field(left, 'Porta:',     str(self.dm.nmea_port), 'number')
-        self._conn=Label(text='Non connesso',font_size=sp(20),color=RED,
-                          bold=True,size_hint_y=None,height=dp(46))
+
+        # --- Intestazione NMEA (compatta) ---
+        left.add_widget(Label(text='NMEA TCP',font_size=sp(16),color=ACCENT,
+                               bold=True,size_hint_y=None,height=dp(28)))
+        self._ip   = self._field(left, 'IP:', str(self.dm.nmea_ip))
+        self._port = self._field(left, 'Porta:', str(self.dm.nmea_port), 'number')
+        self._conn=Label(text='Non connesso',font_size=sp(18),color=RED,
+                          bold=True,size_hint_y=None,height=dp(36))
         left.add_widget(self._conn)
-        br=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(70))
-        br.add_widget(mk_btn_gray('Connetti',    self._connect,    sp(18)))
-        br.add_widget(mk_btn_gray('Disconnetti', self._disconnect, sp(18)))
+        br=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(56))
+        br.add_widget(mk_btn_gray('Connetti',    self._connect,    sp(16)))
+        br.add_widget(mk_btn_gray('Disconnetti', self._disconnect, sp(16)))
         left.add_widget(br)
 
-        # SEZIONE TATTICA: finestra temporale per il calcolo del TWD medio
-        left.add_widget(Label(text='TATTICA',font_size=sp(18),color=ACCENT,
-                               bold=True,size_hint_y=None,height=dp(36)))
+        # --- Tattica (compatta) ---
+        left.add_widget(Label(text='TATTICA',font_size=sp(16),color=ACCENT,
+                               bold=True,size_hint_y=None,height=dp(28)))
         self._twd_btns = {}
-        twd_row = BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
+        twd_row = BoxLayout(spacing=dp(4),size_hint_y=None,height=dp(50))
         for m in (2, 5, 10, 15, 20):
-            b = mk_btn(f'{m}m', lambda mm=m: self._set_twd_window(mm), sp(18))
+            b = mk_btn(f'{m}m', lambda mm=m: self._set_twd_window(mm), sp(16))
             self._twd_btns[m] = b
             twd_row.add_widget(b)
         left.add_widget(twd_row)
         self._refresh_twd_buttons()
 
-        # CONFIGURAZIONE: label header (pulsanti spostati in colonna destra UTILITY)
-        left.add_widget(Label(text='CONFIGURAZIONE',font_size=sp(18),color=ACCENT,
-                               bold=True,size_hint_y=None,height=dp(36)))
+        # --- Configurazione (label informativa compatta) ---
+        left.add_widget(Label(text='CONFIGURAZIONE',font_size=sp(16),color=ACCENT,
+                               bold=True,size_hint_y=None,height=dp(28)))
         left.add_widget(Label(
             text='Modifica sailing_config.json per parametri cloud e path.',
-            font_size=sp(13),color=MUTED,size_hint_y=None,height=dp(36),
+            font_size=sp(12),color=MUTED,size_hint_y=None,height=dp(28),
             halign='left',valign='middle'))
 
-        # NOTA: la sezione Azure Blob e' stata rimossa dalla UI per richiesta
-        # utente. Tutti i parametri sono editabili SOLO via sailing_config.json.
-        # Defaults applicati al primo avvio:
-        #   - cloud_boat_id    = 'soar'
-        #   - blob_base        = 'https://sailingapp.blob.core.windows.net'
-        #   - blob_account_key = chiave master dello storage account
-
-        # NMEA LOG: textbox nera con le ultime righe NMEA ricevute
-        left.add_widget(Label(text='NMEA LOG', font_size=sp(18), color=ACCENT,
-                               bold=True, size_hint_y=None, height=dp(36)))
+        # --- NMEA LOG: occupa la meta' bassa della colonna (size_hint_y=1) ---
+        left.add_widget(Label(text='NMEA LOG', font_size=sp(16), color=ACCENT,
+                               bold=True, size_hint_y=None, height=dp(28)))
         self._nmea_log_box = TextInput(
             text='(nessun dato ricevuto)',
             readonly=True,
@@ -6513,20 +6710,17 @@ class SettingsScreen(TabScreen):
         """Ricarica il config dal file, utile dopo edit manuale del JSON."""
         try:
             self.dm._load_cfg()
-            # Aggiorna le label read-only nella UI
             self._ip.text   = str(self.dm.nmea_ip)
             self._port.text = str(self.dm.nmea_port)
-            # boat_id, blob_base e blob_account_key: solo via JSON, niente UI
             self._refresh_twd_buttons()
             Popup(title='OK',
-                  content=Label(text='Config ricaricato dal file.\n'
-                                       'Tap "Valori path" per\n'
-                                       'verificare i valori in memoria.'),
-                  size_hint=(0.6,0.3)).open()
+                  content=Label(text='Config ricaricato dal file.'),
+                  size_hint=(0.5, 0.22)).open()
         except Exception as e:
+            log_err('_reload_cfg', exc=e)
             Popup(title='Errore ricarica',
                   content=Label(text=f'{type(e).__name__}: {e}'),
-                  size_hint=(0.6,0.3)).open()
+                  size_hint=(0.6, 0.3)).open()
 
     def _download_cfg_from_cloud(self):
         """Scarica sailing_config.json dal blob storage e sovrascrive il file
@@ -6719,37 +6913,51 @@ class SettingsScreen(TabScreen):
     # all'intera UI di gestione cloud.
 
     def _field(self,parent,label,value,kbtype='text'):
-        """Campo testo editabile (label sx + TextInput dx)."""
-        row=BoxLayout(spacing=dp(8),size_hint_y=None,height=dp(64))
-        row.add_widget(Label(text=label,font_size=sp(18),color=MUTED,
-                              size_hint_x=0.30,halign='right',valign='middle'))
+        """Campo testo editabile (label sx + TextInput dx). Compatto."""
+        row=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(52))
+        row.add_widget(Label(text=label,font_size=sp(15),color=MUTED,
+                              size_hint_x=0.28,halign='right',valign='middle'))
         inp=TextInput(text=value,multiline=False,input_type=kbtype,
-                       font_size=sp(16),size_hint_y=None,height=dp(54))
+                       font_size=sp(15),size_hint_y=None,height=dp(44))
         row.add_widget(inp); parent.add_widget(row); return inp
 
     def _connect(self):
-        """Legge IP/Porta dai campi editabili, persiste nel config e connetti."""
-        ip   = self._ip.text.strip()
-        port_s = self._port.text.strip()
-        try: port = int(port_s)
-        except: port = 10110
-        # Aggiorna dm + persisti subito nel config.json
-        self.dm.nmea_ip   = ip
-        self.dm.nmea_port = port
-        self.dm.save_cfg_safe()
-        ok = self.dm.connect(ip, port)
-        self._conn.text  = 'Connesso' if ok else 'Connessione fallita'
-        self._conn.color = GREEN if ok else RED
+        """Legge IP/Porta dai campi editabili, persiste nel config e connette."""
+        try:
+            ip = self._ip.text.strip() or '192.168.4.1'
+            try:
+                port = int(self._port.text.strip())
+            except ValueError:
+                port = 10110
+            self.dm.nmea_ip   = ip
+            self.dm.nmea_port = port
+            self.dm.save_cfg_safe()
+            ok = self.dm.connect(ip, port)
+            self._conn.text  = 'Connesso' if ok else 'Connessione fallita'
+            self._conn.color = GREEN if ok else RED
+        except Exception as e:
+            log_err('_connect', exc=e)
+            self._conn.text = f'Errore: {type(e).__name__}'
+            self._conn.color = RED
 
     def _disconnect(self):
-        self.dm.disconnect(); self._conn.text='Disconnesso'; self._conn.color=MUTED
+        try:
+            self.dm.disconnect()
+            self._conn.text = 'Disconnesso'
+            self._conn.color = MUTED
+        except Exception as e:
+            log_err('_disconnect', exc=e)
 
     def tick(self,dt):
         super().tick(dt)
-        if self.dm.connected: self._conn.text='Connesso'; self._conn.color=GREEN
-        else: self._conn.text='Non connesso'; self._conn.color=RED
-        # Aggiorna NMEA log
-        self._refresh_nmea_log()
+        try:
+            if self.dm.connected:
+                self._conn.text='Connesso'; self._conn.color=GREEN
+            else:
+                self._conn.text='Non connesso'; self._conn.color=RED
+        except Exception: pass
+        try: self._refresh_nmea_log()
+        except Exception: pass
 
     def _refresh_nmea_log(self):
         """Aggiorna la textbox NMEA con le ultime righe del ring buffer.
