@@ -3604,7 +3604,19 @@ class DataManager:
         return True
 
     def connect(self,ip,port):
-        if self.connected: return True
+        # FIX v1.18b: controlla se il recv thread e' ancora vivo prima di
+        # dichiarare "gia' connesso". Se il thread e' morto (es. socket error
+        # su Android) ma connected e' rimasto True, forziamo una riconnessione.
+        if self.connected:
+            if self.recv_thread and self.recv_thread.is_alive():
+                return True
+            # Thread morto con connected=True: resettiamo per riconnetterci
+            print('connect: recv thread morto, forzo reconnect')
+            self.connected = False
+            try:
+                if self.sock: self.sock.close()
+            except: pass
+            self.sock = None
         try:
             self.sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
             self.sock.settimeout(5); self.sock.connect((ip,int(port)))
@@ -3633,6 +3645,7 @@ class DataManager:
             except socket.timeout: continue
             except Exception as e:
                 if self.connected: print(f'Recv:{e}')
+                self.connected=False  # FIX v1.18b: resetta il flag cosi' UI e connect() reagiscono
                 break
 
     def _parse(self,raw):
@@ -6537,77 +6550,96 @@ class SettingsScreen(TabScreen):
         left.add_widget(Widget())
         self._cols.add_widget(left)
 
-        # COLONNA DESTRA: utility (CLOUD UPLOAD spostato in LoggingScreen v1.18)
+        # COLONNA DESTRA: diagnostica inline + utility
         info=BoxLayout(orientation='vertical',spacing=dp(8),
                         padding=dp(14),size_hint_x=0.45)
         _bg(info,PANEL)
-        info.add_widget(Label(text='UTILITY',font_size=sp(18),color=ACCENT,
+        info.add_widget(Label(text='DIAGNOSTICA',font_size=sp(18),color=ACCENT,
                                bold=True,size_hint_y=None,height=dp(36)))
-        # Label descrittiva rimossa nella v1.20.
-        # Tre pulsanti su due righe. Riga 1: diagnostica locale.
-        action_row=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
-        action_row.add_widget(mk_btn_gray('Valori path', self._show_path,  sp(14)))
-        action_row.add_widget(mk_btn_gray('Ric. conf',   self._reload_cfg, sp(14)))
-        info.add_widget(action_row)
-        # Riga 2: download config dal cloud (sovrascrive il file locale)
-        action_row2=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
-        action_row2.add_widget(mk_btn_gray('Scarica config dal cloud',
-                                             self._download_cfg_from_cloud,
-                                             sp(14)))
-        info.add_widget(action_row2)
-        info.add_widget(Widget())
+
+        # TextBox read-only scrollabile: mostra path, NMEA status, valori in
+        # memoria. Si aggiorna ad ogni tick (schermata attiva) e via "Aggiorna".
+        self._diag_box = TextInput(
+            text='',
+            readonly=True,
+            multiline=True,
+            font_size=sp(11),
+            background_color=(0.04, 0.08, 0.16, 1),
+            foreground_color=WHITE,
+            cursor_color=(0, 0, 0, 0),  # cursore invisibile (read-only)
+            size_hint=(1, 1),
+        )
+        info.add_widget(self._diag_box)
+
+        # Pulsanti sotto la textbox
+        btn_row=BoxLayout(spacing=dp(6),size_hint_y=None,height=dp(60))
+        btn_row.add_widget(mk_btn_gray('Aggiorna',  self._refresh_diag,            sp(14)))
+        btn_row.add_widget(mk_btn_gray('Ric. conf', self._reload_cfg,              sp(14)))
+        btn_row.add_widget(mk_btn_gray('Cloud cfg', self._download_cfg_from_cloud, sp(14)))
+        info.add_widget(btn_row)
         self._cols.add_widget(info)
+
+        # Prima populate
+        self._refresh_diag()
 
     def _do_resize(self,dt): pass
 
-    def _show_path(self):
-        """Popup grande con path + valori in memoria, per debug."""
+    def _build_diag_text(self):
+        """Costruisce il testo diagnostico da mostrare nella textbox a destra.
+        Chiamato da _refresh_diag (pulsante) e da tick (aggiornamento live)."""
         dm = self.dm
         cfg_size = '?'
-        cfg_raw = '(file non trovato)'
+        cfg_raw = '(non trovato)'
         try:
             if os.path.isfile(dm.config_path):
-                cfg_size = f'{os.path.getsize(dm.config_path)} byte'
+                cfg_size = f'{os.path.getsize(dm.config_path)}B'
                 with open(dm.config_path) as f:
                     cfg_raw = f.read()
         except Exception as e:
-            cfg_raw = f'(errore lettura: {e})'
-        # Stato file waypoints.json
-        if os.path.isfile(WAYPOINTS_PATH):
-            wpts_status = f'presente ({os.path.getsize(WAYPOINTS_PATH)} byte)'
-        else:
-            wpts_status = '(non presente — usa quelli del config)'
-        # Valori effettivamente in memoria (dopo _load_cfg)
-        bid_disp = dm.cloud_boat_id if dm.cloud_boat_id else '(VUOTO)'
-        key_disp = '(impostato)' if dm.blob_account_key else '(VUOTO)'
-        msg = (f"--- PATH ---\n"
-                f"Config:     {dm.config_path}  ({cfg_size})\n"
-                f"Polare:     {dm.polar_path}\n"
-                f"Waypoints:  {WAYPOINTS_PATH}\n"
-                f"            {wpts_status}\n"
-                f"Log:        {dm.log_dir}\n"
-                f"Coda:       {dm.cloud.queue_path}\n\n"
-                f"--- VALORI IN MEMORIA ---\n"
-                f"NMEA:        {dm.nmea_ip}:{dm.nmea_port}\n"
-                f"TWD window:  {dm.twd_window_minutes} min\n"
-                f"Cloud:       {'ON' if dm.cloud_enabled else 'OFF'} ({dm.cloud_interval_s}s)\n"
-                f"Cloud BoatID:{bid_disp}\n"
-                f"EventHub CS: {'(impostata)' if dm.eventhub_connection_string else '(VUOTA)'}\n"
-                f"Blob base:   {dm.blob_base}\n"
-                f"Account key: {key_disp}\n"
-                f"Waypoints:   {len(dm.waypoints)}\n"
-                f"Boa attiva:  {dm.target_mark or '(nessuna)'}\n\n"
-                f"--- FILE GREZZO sul disco ---\n"
-                f"{cfg_raw}")
-        # Uso ScrollView se il testo e' lungo
-        sv=ScrollView(do_scroll_x=False)
-        lbl=Label(text=msg,font_size=sp(12),halign='left',valign='top',
-                   size_hint_y=None)
-        lbl.bind(width=lambda l,w: setattr(l,'text_size',(w,None)),
-                 texture_size=lambda l,ts: setattr(l,'height',ts[1]))
-        sv.add_widget(lbl)
-        Popup(title='Configurazione attuale',content=sv,
-              size_hint=(0.95,0.92)).open()
+            cfg_raw = f'(err: {e})'
+        wpts_status = (f'{os.path.getsize(WAYPOINTS_PATH)}B'
+                       if os.path.isfile(WAYPOINTS_PATH) else '(assente)')
+        bid_disp  = dm.cloud_boat_id or '(VUOTO)'
+        key_disp  = 'si' if dm.blob_account_key else 'NO'
+        pynmea2_ok = 'OK' if HAS_PYNMEA2 else '*** MANCANTE ***'
+        recv_alive = (dm.recv_thread is not None and dm.recv_thread.is_alive())
+        recv_s = ('vivo' if recv_alive
+                  else 'mai avviato' if dm.recv_thread is None
+                  else '*** MORTO ***')
+        conn_s = 'SI' if dm.connected else 'no'
+        ts = datetime.now().strftime('%H:%M:%S')
+        return (
+            f"[{ts}]\n"
+            f"\n--- NMEA ---\n"
+            f"pynmea2  : {pynmea2_ok}\n"
+            f"connected: {conn_s}\n"
+            f"thread   : {recv_s}\n"
+            f"server   : {dm.nmea_ip}:{dm.nmea_port}\n"
+            f"\n--- CONFIG ---\n"
+            f"file     : {cfg_size}\n"
+            f"TWD win  : {dm.twd_window_minutes}m\n"
+            f"Cloud    : {'ON' if dm.cloud_enabled else 'off'} {dm.cloud_interval_s}s\n"
+            f"BoatID   : {bid_disp}\n"
+            f"EventHub : {'si' if dm.eventhub_connection_string else 'NO'}\n"
+            f"AccKey   : {key_disp}\n"
+            f"Waypts   : {len(dm.waypoints)}\n"
+            f"Boa att. : {dm.target_mark or '(nessuna)'}\n"
+            f"\n--- PATH ---\n"
+            f"cfg : {dm.config_path}\n"
+            f"pol : {dm.polar_path}\n"
+            f"wpt : {WAYPOINTS_PATH} ({wpts_status})\n"
+            f"log : {dm.log_dir}\n"
+            f"\n--- SAILING_CONFIG.JSON ---\n"
+            f"{cfg_raw}"
+        )
+
+    def _refresh_diag(self):
+        """Aggiorna la textbox diagnostica (pulsante Aggiorna o tick)."""
+        try:
+            self._diag_box.text = self._build_diag_text()
+        except Exception as e:
+            self._diag_box.text = f'Errore diagnostica: {e}'
+
 
     def _reload_cfg(self):
         """Ricarica il config dal file, utile dopo edit manuale del JSON."""
@@ -6848,8 +6880,8 @@ class SettingsScreen(TabScreen):
         super().tick(dt)
         if self.dm.connected: self._conn.text='Connesso'; self._conn.color=GREEN
         else: self._conn.text='Non connesso'; self._conn.color=RED
-        # NOTA: aggiornamento status cloud rimosso v1.18: la UI cloud e' stata
-        # spostata nella LoggingScreen che ha il suo tick dedicato.
+        # Aggiorna la textbox diagnostica in tempo reale (ogni 1s)
+        self._refresh_diag()
 
 # =============================================================================
 # APP
